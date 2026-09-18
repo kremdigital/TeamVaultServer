@@ -15,6 +15,7 @@ import ReactMarkdown, {
 } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkFrontmatter from 'remark-frontmatter';
+import remarkBreaks from 'remark-breaks';
 import { ExternalLinkIcon, FileTextIcon, LoaderCircleIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { apiGetText } from '@/lib/api/client';
@@ -260,8 +261,12 @@ export function MarkdownView({
     <>
       {!hideProperties && properties.length > 0 && <PropertiesPanel properties={properties} />}
       <div className={cn('markdown-body')}>
+        {/* `remarkBreaks`: a single newline is a line break, as in Obsidian with
+            "Strict line breaks" off (its default). Plain CommonMark folds such
+            lines into one paragraph — notes read fine in Obsidian but ran
+            together here. */}
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkFrontmatter, remarkWikilink]}
+          remarkPlugins={[remarkGfm, remarkFrontmatter, remarkWikilink, remarkBreaks]}
           urlTransform={transformUrl}
           components={components}
           skipHtml

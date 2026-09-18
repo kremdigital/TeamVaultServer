@@ -68,6 +68,7 @@
     "react-dom": "19.2.4",
     "react-hook-form": "^7.75.0",
     "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
     "shadcn": "^4.7.0",

@@ -97,6 +97,25 @@ describe('MarkdownView', () => {
     // The raw `---` fence must not leak into the rendered body.
     expect(screen.queryByText('---')).not.toBeInTheDocument();
   });
+
+  it('keeps single line breaks, as Obsidian does by default', () => {
+    // Plain CommonMark folds these into one line: «один два три».
+    const { container } = render(
+      <MarkdownView
+        content={'один\nдва\nтри\n\nновый абзац'}
+        files={files}
+        currentFile={current}
+        projectId="P1"
+        onNavigate={vi.fn()}
+        labels={LABELS}
+      />,
+    );
+    const paragraphs = container.querySelectorAll('p');
+    expect(paragraphs).toHaveLength(2);
+    expect(paragraphs[0]!.querySelectorAll('br')).toHaveLength(2);
+    expect(paragraphs[0]!.textContent).toBe('один\nдва\nтри');
+    expect(paragraphs[1]!.textContent).toBe('новый абзац');
+  });
 });
 
 /** Renders with an isolated projectId so the note-content cache key is unique. */
