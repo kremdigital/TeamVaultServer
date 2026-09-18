@@ -19,6 +19,14 @@ interface NoteEditorProps {
   fileId: string;
   /** Display name of the current user — shown to peers via awareness. */
   userName?: string | undefined;
+  /**
+   * Receives the note's current text when the editor closes (back to the read
+   * view, or another note opened). The read view loads a note once, and the
+   * server writes edits to disk only after they settle — so without this the
+   * view went on showing the text from before the edit. Not called if the
+   * note never loaded: an empty text must not replace the view's copy.
+   */
+  onExit?: ((text: string) => void) | undefined;
 }
 
 type JoinAck = { ok: true } | { ok: false; error: string };
@@ -44,15 +52,21 @@ function colorFor(seed: string): string {
  * Obsidian) instantly. Write permission is enforced server-side on every
  * `yjs:update`; a VIEWER lands in the `forbidden` state.
  */
-export function NoteEditor({ projectId, fileId, userName }: NoteEditorProps): ReactElement {
+export function NoteEditor({ projectId, fileId, userName, onExit }: NoteEditorProps): ReactElement {
   const t = useTranslations('notes');
   const { resolvedTheme } = useTheme();
   const hostRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<Status>('connecting');
   const [connected, setConnected] = useState(false);
+  // Kept in a ref so a new callback identity doesn't tear down the editor.
+  const onExitRef = useRef(onExit);
+  useEffect(() => {
+    onExitRef.current = onExit;
+  });
 
   useEffect(() => {
     let destroyed = false;
+    let seeded = false;
     const socket = getSocket();
     const doc = new Y.Doc();
     const ytext = doc.getText('content');
@@ -108,6 +122,7 @@ export function NoteEditor({ projectId, fileId, userName }: NoteEditorProps): Re
 
         // Seed the local doc with the server's authoritative state.
         Y.applyUpdate(doc, Uint8Array.from(fetched.sync1), REMOTE_ORIGIN);
+        seeded = true;
 
         awareness.setLocalStateField('user', {
           name: userName ?? 'Web',
@@ -139,6 +154,7 @@ export function NoteEditor({ projectId, fileId, userName }: NoteEditorProps): Re
 
     return () => {
       destroyed = true;
+      if (seeded) onExitRef.current?.(ytext.toString());
       doc.off('update', onLocalUpdate);
       socket.off('yjs:update', onRemoteUpdate);
       socket.off('connect', onConnect);

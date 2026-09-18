@@ -565,6 +565,9 @@ export function NotesBrowser({
                   projectId={projectId}
                   fileId={selected.id}
                   userName={userName}
+                  // The read view shows `content`, fetched once per note —
+                  // hand it the editor's text, edits included, on the way out.
+                  onExit={setContent}
                 />
               </div>
             ) : loading ? (
