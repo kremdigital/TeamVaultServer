@@ -32,6 +32,48 @@ describe('normalizeVaultPath', () => {
     expect(() => normalizeVaultPath('a/.versions/b')).toThrow(InvalidPathError);
   });
 
+  /**
+   * Клиентские папки — вторая половина гейта путей (TASK-0027, аудит перед
+   * подачей в каталог). Путь `.obsidian/plugins/team-vault/data.json`,
+   * созданный участником проекта, заставлял клиент другого участника отдать
+   * собственный файл настроек вместе с API-ключом. Запрет только на входящих
+   * путях: уже сохранённые строки должны оставаться читаемыми и удаляемыми,
+   * иначе утёкший файл нечем убрать.
+   */
+  it('rejects client-side folders: config, trash, repository', () => {
+    expect(() => normalizeVaultPath('.obsidian/plugins/team-vault/data.json')).toThrow(
+      /Reserved folder name/,
+    );
+    expect(() => normalizeVaultPath('.trash/deleted.md')).toThrow(/Reserved folder name/);
+    expect(() => normalizeVaultPath('notes/.git/HEAD')).toThrow(/Reserved folder name/);
+  });
+
+  it('rejects reserved folders regardless of case', () => {
+    expect(() => normalizeVaultPath('.OBSIDIAN/plugins/team-vault/data.json')).toThrow(
+      /Reserved folder name/,
+    );
+    expect(() => normalizeVaultPath('.Trash/note.md')).toThrow(/Reserved folder name/);
+  });
+
+  it('keeps notes whose name merely resembles a reserved folder', () => {
+    expect(normalizeVaultPath('.obsidian-notes/idea.md')).toBe('.obsidian-notes/idea.md');
+    expect(normalizeVaultPath('notes/.gitignore')).toBe('notes/.gitignore');
+    expect(normalizeVaultPath('.trashed.md')).toBe('.trashed.md');
+  });
+
+  it('allows client folders for paths already stored (reads, cleanup)', () => {
+    expect(normalizeVaultPath('.trash/deleted.md', { allowClientDirs: true })).toBe(
+      '.trash/deleted.md',
+    );
+    expect(
+      normalizeVaultPath('.obsidian/plugins/team-vault/data.json', { allowClientDirs: true }),
+    ).toBe('.obsidian/plugins/team-vault/data.json');
+    // Раскладка хранилища сервера остаётся запрещённой в обе стороны.
+    expect(() => normalizeVaultPath('.versions/x', { allowClientDirs: true })).toThrow(
+      InvalidPathError,
+    );
+  });
+
   it('rejects empty input', () => {
     expect(() => normalizeVaultPath('')).toThrow(InvalidPathError);
     expect(() => normalizeVaultPath('/')).toThrow(InvalidPathError);
@@ -48,5 +90,13 @@ describe('resolveProjectFile', () => {
   it('refuses traversal even after normalization', () => {
     process.env.STORAGE_PATH = '/tmp/storage';
     expect(() => resolveProjectFile('proj-1', '../../etc/passwd')).toThrow(InvalidPathError);
+  });
+
+  it('still resolves a legacy path under a client folder', () => {
+    // Строка могла попасть в БД до запрета — скачать и удалить её должно быть
+    // можно, иначе утёкший `data.json` не вычистить ничем, кроме правки БД.
+    process.env.STORAGE_PATH = '/tmp/storage';
+    const resolved = resolveProjectFile('proj-1', '.trash/note.md');
+    expect(resolved.replaceAll('\\', '/')).toContain('proj-1/.trash/note.md');
   });
 });

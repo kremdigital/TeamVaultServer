@@ -36,11 +36,16 @@ async function childrenOf(projectId: string, folder: string) {
   });
 }
 
-function normalizeFolder(raw: string): string | null {
+function normalizeFolder(raw: string, opts: { existing?: boolean } = {}): string | null {
   try {
     // `normalizeVaultPath` рассчитан на файлы, но проверки те же: без ведущего
     // слэша, без `..`, без выхода за корень. Хвостовой слэш срезаем сами.
-    return normalizeVaultPath(raw.replace(/\/+$/, ''));
+    // `existing` — папка уже лежит в проекте (источник переименования,
+    // удаление): для неё клиентские зарезервированные имена разрешены, иначе
+    // унаследованную `.trash/` нельзя было бы ни переименовать, ни удалить.
+    return normalizeVaultPath(raw.replace(/\/+$/, ''), {
+      ...(opts.existing === true ? { allowClientDirs: true } : {}),
+    });
   } catch (err) {
     if (err instanceof InvalidPathError) return null;
     throw err;
@@ -59,7 +64,7 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Ne
   const parsed = await parseJsonBody(request, renameSchema);
   if (!parsed.ok) return parsed.response;
 
-  const from = normalizeFolder(parsed.data.path);
+  const from = normalizeFolder(parsed.data.path, { existing: true });
   const to = normalizeFolder(parsed.data.newPath);
   if (!from || !to) return errors.invalid('invalid_path', 'Недопустимый путь папки');
   if (from === to) return NextResponse.json({ path: to, moved: 0 });
@@ -151,7 +156,7 @@ export async function DELETE(request: Request, context: RouteContext): Promise<N
   if (!canEditFiles(user, access)) return errors.forbidden();
 
   const raw = new URL(request.url).searchParams.get('path');
-  const folder = raw ? normalizeFolder(raw) : null;
+  const folder = raw ? normalizeFolder(raw, { existing: true }) : null;
   if (!folder) return errors.invalid('invalid_path', 'Недопустимый путь папки');
 
   const files = await childrenOf(id, folder);

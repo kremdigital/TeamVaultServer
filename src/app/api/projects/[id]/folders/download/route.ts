@@ -31,7 +31,7 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
   if (!raw) return errors.invalid('missing_path', 'Не указана папка');
   let folder: string;
   try {
-    folder = normalizeVaultPath(raw);
+    folder = normalizeVaultPath(raw, { allowClientDirs: true });
   } catch (err) {
     if (err instanceof InvalidPathError) return errors.invalid('invalid_path', err.message);
     throw err;

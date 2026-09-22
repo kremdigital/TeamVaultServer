@@ -4,7 +4,8 @@ import { canEditFiles, loadProjectAccess } from '@/lib/auth/permissions';
 import { applyOperation, type OperationInput } from '@/lib/sync/operation-log';
 import { increment, type VectorClock, parseClock } from '@/lib/sync/vector-clock';
 import { child } from '@/lib/logger';
-import { deleteStagedBlob, readStagedBlob } from '@/lib/files/storage';
+import { deleteStagedBlob, PathIsDirectoryError, readStagedBlob } from '@/lib/files/storage';
+import { InvalidPathError } from '@/lib/files/paths';
 import { getSocketUser, projectRoom } from '../auth';
 
 interface BaseEnvelope {
@@ -266,7 +267,17 @@ function serializeLog(log: { id: string; vectorClock: unknown; createdAt: Date }
   };
 }
 
+/**
+ * Ack error text. Stable machine codes where the client has to branch on
+ * them: it classifies an ack as retryable by string, and a human-readable
+ * message like "Reserved folder name: .trash" was treated as a temporary
+ * failure — the queued operation then blocked the whole offline queue on
+ * every reconnect, silently (TASK-0027). A rejected path can never succeed on
+ * a retry, so it gets its own code.
+ */
 function errorMessage(err: unknown): string {
+  if (err instanceof InvalidPathError) return 'invalid_path';
+  if (err instanceof PathIsDirectoryError) return 'path_is_directory';
   return err instanceof Error ? err.message : 'unknown_error';
 }
 
