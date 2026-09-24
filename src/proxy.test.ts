@@ -1,7 +1,6 @@
 // @vitest-environment node
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-import { SignJWT } from 'jose';
 import { signAccessToken, verifyAccessToken } from '@/lib/auth/jwt';
 import proxy from './proxy';
 
@@ -13,29 +12,13 @@ beforeAll(() => {
   process.env.JWT_REMEMBER_TTL = '30d';
 });
 
+const DAY = 24 * 3600;
+const REMEMBER_TTL = 30 * DAY;
+
 function withAccessCookie(url: string, token: string): NextRequest {
   return new NextRequest(`http://localhost${url}`, {
     headers: { cookie: `osync_access=${token}` },
   });
-}
-
-/**
- * Mint a remember-me access token that expires `secondsLeft` from now.
- *
- * Built by hand rather than via `signAccessToken` + `setTimeout`: the sliding
- * check compares `exp` against wall-clock time, so the old approach — a 2 s
- * window slept through for 1.1 s — failed outright whenever the machine
- * stalled long enough for the token to expire completely. Setting `exp`
- * directly gives days of slack instead of milliseconds.
- */
-async function staleRememberToken(secondsLeft: number): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  return new SignJWT({ role: 'USER', type: 'access', rememberMe: true })
-    .setProtectedHeader({ alg: 'HS256' })
-    .setSubject('user-1')
-    .setIssuedAt(now - 60)
-    .setExpirationTime(now + secondsLeft)
-    .sign(new TextEncoder().encode(process.env.JWT_SECRET!));
 }
 
 function readSetCookieToken(response: Response): string | null {
@@ -45,51 +28,85 @@ function readSetCookieToken(response: Response): string | null {
   return m && m[1] ? decodeURIComponent(m[1]) : null;
 }
 
+/**
+ * Время в этих тестах фейковое: подменён только `Date`, таймеры настоящие.
+ * Токен выпускается настоящим `signAccessToken` в момент T0, затем часы
+ * переводятся вперёд на нужную точку окна. И подпись, и проверка `exp` в jose,
+ * и расчёт остатка в `proxy` читают одни и те же часы, поэтому исход не зависит
+ * от скорости машины.
+ *
+ * Раньше кейсы с коротким окном спали 1,1 с внутри двухсекундного токена. Если
+ * машина задерживалась, токен истекал целиком: кейс со скольжением падал, а кейс
+ * без скольжения проходил вхолостую — истёкший токен тоже не даёт Set-Cookie
+ * (TASK-0022).
+ */
 describe('proxy — sliding "Remember me" sessions', () => {
+  const T0 = new Date('2026-09-01T00:00:00.000Z');
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  /** Перевести фейковые часы на `seconds` после выпуска токена. */
+  const advance = (seconds: number) => vi.setSystemTime(T0.getTime() + seconds * 1000);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('does not refresh a fresh remember-me token (plenty of life left)', async () => {
-    // Default 30 d TTL; a token signed right now has > 15 d remaining,
-    // so the half-life trigger should NOT fire.
     const token = await signAccessToken('user-1', 'USER', { rememberMe: true });
     const res = await proxy(withAccessCookie('/dashboard', token));
+    expect(res.headers.get('location')).toBeNull();
     expect(readSetCookieToken(res)).toBeNull();
   });
 
   it('refreshes a remember-me token past the half-life mark', async () => {
-    // 30 d window, token with 5 d left: 5*2 < 30, so the half-life trigger
-    // fires. No sleeping, no race with the clock.
-    const stale = await staleRememberToken(5 * 24 * 3600);
+    const stale = await signAccessToken('user-1', 'USER', { rememberMe: true });
+    advance(25 * DAY); // 5 d left of 30 d: 5*2 < 30, the half-life trigger fires
 
     const res = await proxy(withAccessCookie('/dashboard', stale));
     const fresh = readSetCookieToken(res);
     expect(fresh).not.toBeNull();
     expect(fresh).not.toBe(stale);
+    // The cookie's lifetime restarts from this visit, not from login.
+    expect(res.headers.get('set-cookie')).toMatch(new RegExp(`Max-Age=${REMEMBER_TTL}(;|$)`));
 
-    // Fresh token should re-verify and carry the same rememberMe flag.
+    // Fresh token re-verifies, keeps the rememberMe flag and gets a full window.
     const payload = await verifyAccessToken(fresh!);
     expect(payload?.rememberMe).toBe(true);
     expect(payload?.sub).toBe('user-1');
+    expect(payload?.exp).toBe(nowSeconds() + REMEMBER_TTL);
   });
 
   it('leaves a remember-me token alone while more than half the window remains', async () => {
-    // Mirror case, same mechanism: 20 d left of 30 d → 20*2 > 30, no re-issue.
-    const res = await proxy(
-      withAccessCookie('/dashboard', await staleRememberToken(20 * 24 * 3600)),
-    );
+    const token = await signAccessToken('user-1', 'USER', { rememberMe: true });
+    advance(10 * DAY); // 20 d left of 30 d: 20*2 > 30, no re-issue
+    const res = await proxy(withAccessCookie('/dashboard', token));
+    expect(res.headers.get('location')).toBeNull();
     expect(readSetCookieToken(res)).toBeNull();
   });
 
+  it('slides exactly at the half-life mark, not a second earlier', async () => {
+    const token = await signAccessToken('user-1', 'USER', { rememberMe: true });
+
+    advance(REMEMBER_TTL / 2 - 1);
+    expect(readSetCookieToken(await proxy(withAccessCookie('/dashboard', token)))).toBeNull();
+
+    advance(REMEMBER_TTL / 2);
+    expect(readSetCookieToken(await proxy(withAccessCookie('/dashboard', token)))).not.toBeNull();
+  });
+
   it('does not slide short (non-remember-me) sessions', async () => {
-    process.env.JWT_ACCESS_TTL = '2s';
-    try {
-      const stale = await signAccessToken('user-1', 'USER');
-      await new Promise((r) => setTimeout(r, 1100));
-      const res = await proxy(withAccessCookie('/dashboard', stale));
-      // Short session — proxy must not touch the cookie even when the
-      // remaining life is small.
-      expect(readSetCookieToken(res)).toBeNull();
-    } finally {
-      process.env.JWT_ACCESS_TTL = '15m';
-    }
+    const token = await signAccessToken('user-1', 'USER'); // default 15 min
+    advance(14 * 60); // 1 min left: far past the half-life of any window
+
+    const res = await proxy(withAccessCookie('/dashboard', token));
+    // The token is still valid — the request passes through, not to a
+    // redirect — and the proxy must not touch the cookie.
+    expect(res.headers.get('location')).toBeNull();
+    expect(readSetCookieToken(res)).toBeNull();
   });
 
   it('does not slide for Bearer-token (plugin) requests', async () => {
@@ -97,10 +114,16 @@ describe('proxy — sliding "Remember me" sessions', () => {
     // Sliding the cookie there would be pointless and might overwrite
     // an unrelated session if the same browser had one.
     const token = await signAccessToken('user-1', 'USER', { rememberMe: true });
+    advance(25 * DAY);
+
+    // Control: the very same token in the cookie is due for a slide.
+    expect(readSetCookieToken(await proxy(withAccessCookie('/dashboard', token)))).not.toBeNull();
+
     const req = new NextRequest('http://localhost/dashboard', {
       headers: { authorization: `Bearer ${token}` },
     });
     const res = await proxy(req);
+    expect(res.headers.get('location')).toBeNull();
     expect(readSetCookieToken(res)).toBeNull();
   });
 });
