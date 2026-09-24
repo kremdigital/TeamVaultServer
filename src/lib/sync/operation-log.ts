@@ -164,7 +164,18 @@ async function applyCreate(
   let conflictRenamed = false;
 
   if (existing) {
-    pathToUse = appendConflictSuffix(normalizedPath, ctx.clientId);
+    // The copy goes to the first free `<path>.conflict-<clientId>[-n]`. A row
+    // already there is taken over only when it is a tombstone (revived below)
+    // or holds this very content — the same CREATE retried after a lost ack. A
+    // live row with other content is a DIFFERENT note: this client's earlier
+    // rename-conflict copy, or its earlier conflict CREATE of other text.
+    // Writing the new text over it erased that note for the whole team, since
+    // the history is extended and every device applied the deletion.
+    pathToUse = await pickConflictPath(
+      ctx,
+      normalizedPath,
+      (row) => row.deletedAt !== null || row.contentHash === op.payload.contentHash,
+    );
     conflictRenamed = true;
   }
 
@@ -175,11 +186,11 @@ async function applyCreate(
   // already sits there — leaving the client stuck retrying the CREATE (and,
   // with REST-staged binaries, orphaning the staged blob). Two ways that
   // happens: (1) a soft-deleted row at the path — re-creating a deleted path;
-  // (2) a *live* conflict copy from this same client's earlier
-  // conflict-rename being retried — `<path>.conflict-<clientId>` already
-  // exists. Both are handled by updating the existing row in place instead of
-  // colliding on a duplicate create: revive it if it was a tombstone, or
-  // idempotently refresh the conflict copy's content if it was already live.
+  // (2) a *live* conflict copy with this same content from this same client's
+  // earlier conflict CREATE being retried. Both are handled by updating the
+  // existing row in place instead of colliding on a duplicate create: revive
+  // it if it was a tombstone, or idempotently re-apply the same content if it
+  // was already live.
   const atPath = await prisma.vaultFile.findUnique({
     where: { projectId_path: { projectId: ctx.projectId, path: pathToUse } },
     select: { id: true, deletedAt: true },
@@ -196,10 +207,10 @@ async function applyCreate(
   // (delete all + insert), exactly like a REST UPDATE. Replacing it with
   // `buildInitialState` gave the same fileId an independent history, and every
   // device still holding the old one (offline while the note was deleted and
-  // re-created — "Untitled", a template, restore from trash — or a retried
-  // conflict CREATE) merged both texts and pushed the duplicate to the whole
-  // team. Written before the row is revived, so a `yjs:update` for the fileId
-  // can't be accepted against the old state in between.
+  // re-created — "Untitled", a template, restore from trash) merged both texts
+  // and pushed the duplicate to the whole team. Written before the row is
+  // revived, so a `yjs:update` for the fileId can't be accepted against the
+  // old state in between.
   const text = op.payload.fileType === 'TEXT' ? op.data.toString('utf8') : null;
   if (atPath && text !== null) await writeYjsText(atPath.id, text);
 
@@ -381,8 +392,18 @@ async function applyMove(
     select: { id: true },
   });
   if (collision && collision.id !== file.id) {
-    // Re-route: append conflict suffix.
-    const conflictPath = appendConflictSuffix(normalizedNew, ctx.clientId);
+    // Re-route to the first free `<path>.conflict-<clientId>[-n]`. The first
+    // name can already be taken — by this client's conflict copy of another
+    // file, or by a tombstone. The move then overwrote that file's bytes on
+    // disk (a binary's only copy) before the row update hit the unique index,
+    // and the failed operation stayed in the client's queue for good. The
+    // file itself already sitting there is this same rename retried.
+    const conflictPath = await pickConflictPath(
+      ctx,
+      normalizedNew,
+      (row) => row.deletedAt !== null || row.id === file.id,
+    );
+    await dropTombstoneAt(ctx.projectId, conflictPath);
     await moveProjectFile(ctx.projectId, file.path, conflictPath);
     await prisma.vaultFile.update({
       where: { id: file.id },
@@ -418,13 +439,7 @@ async function applyMove(
   // The tombstone was already user-deleted intent; clearing it lets the
   // rename proceed (`onDelete: Cascade` takes care of its Yjs doc + version
   // history).
-  const tombstoneAtTarget = await prisma.vaultFile.findUnique({
-    where: { projectId_path: { projectId: ctx.projectId, path: normalizedNew } },
-    select: { id: true, deletedAt: true },
-  });
-  if (tombstoneAtTarget && tombstoneAtTarget.deletedAt !== null) {
-    await prisma.vaultFile.delete({ where: { id: tombstoneAtTarget.id } });
-  }
+  await dropTombstoneAt(ctx.projectId, normalizedNew);
 
   await moveProjectFile(ctx.projectId, file.path, normalizedNew);
   await prisma.vaultFile.update({
@@ -476,12 +491,58 @@ async function writeLog(
   });
 }
 
-export function appendConflictSuffix(path: string, clientId: string): string {
+/**
+ * `<path>.conflict-<clientId>` — or, for `attempt` ≥ 2, `…conflict-<clientId>-<attempt>`,
+ * the next name tried when the first one is taken (see {@link pickConflictPath}).
+ * The counter goes after the sanitized id, so a long clientId cut to 32 chars
+ * doesn't cut the counter off with it.
+ */
+export function appendConflictSuffix(path: string, clientId: string, attempt = 1): string {
   const sanitized = clientId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'unknown';
+  const tag = attempt > 1 ? `${sanitized}-${attempt}` : sanitized;
   const lastDot = path.lastIndexOf('.');
   const lastSlash = path.lastIndexOf('/');
   if (lastDot > lastSlash) {
-    return `${path.slice(0, lastDot)}.conflict-${sanitized}${path.slice(lastDot)}`;
+    return `${path.slice(0, lastDot)}.conflict-${tag}${path.slice(lastDot)}`;
   }
-  return `${path}.conflict-${sanitized}`;
+  return `${path}.conflict-${tag}`;
+}
+
+/**
+ * Clear a tombstone sitting at `path` so a live file can move there (the unique
+ * index spans tombstones). `onDelete: Cascade` takes its Yjs doc and versions.
+ */
+async function dropTombstoneAt(projectId: string, path: string): Promise<void> {
+  const row = await prisma.vaultFile.findUnique({
+    where: { projectId_path: { projectId, path } },
+    select: { id: true, deletedAt: true },
+  });
+  if (row && row.deletedAt !== null) {
+    await prisma.vaultFile.delete({ where: { id: row.id } });
+  }
+}
+
+/** How many `<path>.conflict-<clientId>[-n]` names {@link pickConflictPath} tries. */
+const MAX_CONFLICT_ATTEMPTS = 100;
+
+/**
+ * The first `<path>.conflict-<clientId>[-n]` this operation may use: no row
+ * there, or a row `usable` accepts (a tombstone, a retry of this very
+ * operation). Any other live row is another file and is skipped — writing or
+ * moving onto it destroyed that file's content.
+ */
+async function pickConflictPath(
+  ctx: ApplyContext,
+  path: string,
+  usable: (row: { id: string; deletedAt: Date | null; contentHash: string }) => boolean,
+): Promise<string> {
+  for (let attempt = 1; attempt <= MAX_CONFLICT_ATTEMPTS; attempt++) {
+    const candidate = appendConflictSuffix(path, ctx.clientId, attempt);
+    const row = await prisma.vaultFile.findUnique({
+      where: { projectId_path: { projectId: ctx.projectId, path: candidate } },
+      select: { id: true, deletedAt: true, contentHash: true },
+    });
+    if (!row || usable(row)) return candidate;
+  }
+  throw new Error('conflict_path_exhausted');
 }

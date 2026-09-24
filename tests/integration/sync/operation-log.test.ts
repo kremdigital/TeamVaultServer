@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -64,6 +64,13 @@ describe('appendConflictSuffix', () => {
   });
   it('sanitizes weird clientIds', () => {
     expect(appendConflictSuffix('note.md', 'a/b c<>')).toBe('note.conflict-a_b_c__.md');
+  });
+  it('numbers the next candidates after the sanitized id, even a long one', () => {
+    expect(appendConflictSuffix('note.md', 'A1', 1)).toBe('note.conflict-A1.md');
+    expect(appendConflictSuffix('note.md', 'A1', 2)).toBe('note.conflict-A1-2.md');
+    expect(appendConflictSuffix('readme', 'A1', 3)).toBe('readme.conflict-A1-3');
+    const long = 'x'.repeat(40);
+    expect(appendConflictSuffix('n.md', long, 2)).toBe(`n.conflict-${'x'.repeat(32)}-2.md`);
   });
 });
 
@@ -374,10 +381,11 @@ describe('applyOperation: CREATE on a tombstone extends the Y.Doc history', () =
     expect(textOf(await storedState(fileId))).toBe(NEW);
   });
 
-  it('a retried conflict CREATE with new content extends the conflict copy history', async () => {
-    // The same client re-sends a CREATE for a path still held by another file:
-    // the row at `<path>.conflict-<clientId>` is live and keeps its id, and
-    // clients already hold its first history (the server broadcast it).
+  it('a second conflict CREATE with other content gets its own copy, the first is kept', async () => {
+    // The same client sends another CREATE for a path still held by another
+    // file. The live row at `<path>.conflict-<clientId>` is only this
+    // operation's copy if it holds the same content (a retry after a lost ack);
+    // with other content it is another note, and peers hold its history.
     const { projectId, ownerId } = await seedProject();
     await applyOperation(
       { projectId, authorId: ownerId, clientId: 'client-A', vectorClock: { 'client-A': 1 } },
@@ -406,17 +414,116 @@ describe('applyOperation: CREATE on a tombstone extends the Y.Doc history', () =
     Y.applyUpdate(peer, await storedState(copyId));
     expect(peer.getText(TEXT_KEY).toString()).toBe('mine v1\n');
 
-    // Same content again: the stored history is left exactly as it was.
+    // Same content again: the same copy, its stored history left exactly as it was.
     const firstState = Buffer.from(await storedState(copyId));
-    await conflictCreate('mine v1\n', 'h2', 2);
+    const same = await conflictCreate('mine v1\n', 'h2', 2);
+    expect(same.outcome).toMatchObject({ kind: 'conflict_create_renamed', fileId: copyId });
     expect(Buffer.from(await storedState(copyId)).equals(firstState)).toBe(true);
 
-    // New content: the peer holding the first history ends up with it alone.
-    const retry = await conflictCreate('mine v2\n', 'h3', 3);
-    expect(retry.outcome).toMatchObject({ kind: 'conflict_create_renamed', fileId: copyId });
-    expect(retry.log.payload).not.toHaveProperty('revived');
+    // Other content: a copy of its own at the next free name. The first copy
+    // and the peer holding its history keep "mine v1".
+    const other = await conflictCreate('mine v2\n', 'h3', 3);
+    if (other.outcome.kind !== 'conflict_create_renamed') throw new Error('expected conflict');
+    expect(other.outcome.finalPath).toBe('collide.conflict-client-B-2.md');
+    expect(other.outcome.fileId).not.toBe(copyId);
+    expect(other.log.payload).not.toHaveProperty('revived');
+    expect(textOf(await storedState(other.outcome.fileId))).toBe('mine v2\n');
     Y.applyUpdate(peer, await storedState(copyId));
-    expect(peer.getText(TEXT_KEY).toString()).toBe('mine v2\n');
+    expect(peer.getText(TEXT_KEY).toString()).toBe('mine v1\n');
+
+    // Its retry lands on its own copy, not on the first one.
+    const otherAgain = await conflictCreate('mine v2\n', 'h3', 4);
+    expect(otherAgain.outcome).toMatchObject({ fileId: other.outcome.fileId });
+    const paths = await testPrisma.vaultFile.findMany({
+      where: { projectId },
+      orderBy: { path: 'asc' },
+      select: { path: true },
+    });
+    expect(paths.map((f) => f.path)).toEqual([
+      'collide.conflict-client-B-2.md',
+      'collide.conflict-client-B.md',
+      'collide.md',
+    ]);
+  });
+
+  it("a conflict CREATE does not write over this client's rename-conflict copy of another note", async () => {
+    // Review of 0.3.8 (server, #1). B renames note X onto a taken name, the
+    // server parks X at `collide.conflict-B.md`. Later B creates a new note
+    // under the same, still taken, name. The CREATE took X's row as "its"
+    // conflict copy and, since the history is extended, deleted X's text on
+    // the server and on every device holding X.
+    const { projectId, ownerId } = await seedProject();
+    const create = (path: string, text: string, clientId: string, n: number) =>
+      applyOperation(
+        { projectId, authorId: ownerId, clientId, vectorClock: { [clientId]: n } },
+        {
+          opType: 'CREATE',
+          filePath: path,
+          payload: { fileType: 'TEXT', contentHash: `h-${text}`, size: text.length },
+          data: Buffer.from(text),
+        },
+      );
+    await create('collide.md', 'winner\n', 'A', 1);
+    const x = await create('x.md', 'X precious\n', 'B', 1);
+    if (x.outcome.kind !== 'created') throw new Error('expected created');
+    const xId = x.outcome.fileId;
+    const parked = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+      { opType: 'RENAME', filePath: 'x.md', newPath: 'collide.md', payload: { fileId: xId } },
+    );
+    expect(parked.outcome).toMatchObject({ finalPath: 'collide.conflict-B.md' });
+    const holder = new Y.Doc();
+    Y.applyUpdate(holder, await storedState(xId));
+
+    const fresh = await create('collide.md', 'unrelated new note\n', 'B', 3);
+    if (fresh.outcome.kind !== 'conflict_create_renamed') throw new Error('expected conflict');
+    expect(fresh.outcome.fileId).not.toBe(xId);
+    expect(fresh.outcome.finalPath).toBe('collide.conflict-B-2.md');
+    expect(textOf(await storedState(fresh.outcome.fileId))).toBe('unrelated new note\n');
+
+    const xState = await storedState(xId);
+    expect(textOf(xState)).toBe('X precious\n');
+    Y.applyUpdate(holder, xState);
+    expect(holder.getText(TEXT_KEY).toString()).toBe('X precious\n');
+    const xRow = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: xId } });
+    expect(xRow).toMatchObject({ path: 'collide.conflict-B.md', contentHash: 'h-X precious\n' });
+    expect(await readFile(join(storageRoot, projectId, 'collide.conflict-B.md'), 'utf8')).toBe(
+      'X precious\n',
+    );
+  });
+
+  it('a conflict CREATE revives a deleted conflict copy of this client at that name', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const create = (text: string, clientId: string, n: number) =>
+      applyOperation(
+        { projectId, authorId: ownerId, clientId, vectorClock: { [clientId]: n } },
+        {
+          opType: 'CREATE',
+          filePath: 'collide.md',
+          payload: { fileType: 'TEXT', contentHash: `h-${text}`, size: text.length },
+          data: Buffer.from(text),
+        },
+      );
+    await create('winner\n', 'A', 1);
+    const first = await create('first copy\n', 'B', 1);
+    if (first.outcome.kind !== 'conflict_create_renamed') throw new Error('expected conflict');
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+      {
+        opType: 'DELETE',
+        filePath: first.outcome.finalPath,
+        payload: { fileId: first.outcome.fileId },
+      },
+    );
+
+    const again = await create('second copy\n', 'B', 3);
+    expect(again.outcome).toMatchObject({
+      kind: 'conflict_create_renamed',
+      fileId: first.outcome.fileId,
+      finalPath: 'collide.conflict-B.md',
+    });
+    expect(again.log.payload).toMatchObject({ revived: true });
+    expect(textOf(await storedState(first.outcome.fileId))).toBe('second copy\n');
   });
 
   it('a first CREATE is not marked revived', async () => {
@@ -560,6 +667,91 @@ describe('applyOperation: concurrent RENAME', () => {
     if (second.outcome.kind === 'conflict_create_renamed') {
       expect(second.outcome.finalPath).toBe('target.conflict-B.md');
     }
+  });
+
+  describe('when the conflict name is already taken', () => {
+    const binary = (projectId: string, ownerId: string, path: string, bytes: string, n: number) =>
+      applyOperation(
+        { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: n } },
+        {
+          opType: 'CREATE',
+          filePath: path,
+          payload: { fileType: 'BINARY', contentHash: `h-${bytes}`, size: bytes.length },
+          data: Buffer.from(bytes),
+        },
+      );
+    const renameOntoTaken = (projectId: string, ownerId: string, fileId: string, n: number) =>
+      applyOperation(
+        { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: n } },
+        { opType: 'RENAME', filePath: 'other.png', newPath: 'pic.png', payload: { fileId } },
+      );
+    const disk = (projectId: string, path: string) =>
+      readFile(join(storageRoot, projectId, path), 'utf8').catch(() => null);
+
+    async function takenName() {
+      const { projectId, ownerId } = await seedProject();
+      await applyOperation(
+        { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+        {
+          opType: 'CREATE',
+          filePath: 'pic.png',
+          payload: { fileType: 'BINARY', contentHash: 'h-winner', size: 6 },
+          data: Buffer.from('winner'),
+        },
+      );
+      // B's own conflict CREATE on that name takes `pic.conflict-B.png`.
+      const copy = await binary(projectId, ownerId, 'pic.png', 'mine', 1);
+      if (copy.outcome.kind !== 'conflict_create_renamed') throw new Error('expected conflict');
+      expect(copy.outcome.finalPath).toBe('pic.conflict-B.png');
+      const other = await binary(projectId, ownerId, 'other.png', 'other bytes', 2);
+      if (other.outcome.kind !== 'created') throw new Error('expected created');
+      return { projectId, ownerId, copy: copy.outcome, otherId: other.outcome.fileId };
+    }
+
+    it('a conflict RENAME does not move over the conflict copy of another file', async () => {
+      // The move overwrote the copy's bytes on disk — for a binary its only
+      // copy — and then failed on the unique index; the client kept retrying.
+      const { projectId, ownerId, copy, otherId } = await takenName();
+
+      const renamed = await renameOntoTaken(projectId, ownerId, otherId, 3);
+      expect(renamed.outcome).toMatchObject({
+        kind: 'conflict_create_renamed',
+        fileId: otherId,
+        finalPath: 'pic.conflict-B-2.png',
+      });
+      expect(await disk(projectId, 'pic.conflict-B.png')).toBe('mine');
+      expect(await disk(projectId, 'pic.conflict-B-2.png')).toBe('other bytes');
+      const rows = await testPrisma.vaultFile.findMany({
+        where: { projectId },
+        orderBy: { path: 'asc' },
+        select: { id: true, path: true },
+      });
+      expect(rows).toEqual([
+        { id: otherId, path: 'pic.conflict-B-2.png' },
+        { id: copy.fileId, path: 'pic.conflict-B.png' },
+        expect.objectContaining({ path: 'pic.png' }),
+      ]);
+
+      // The same rename retried leaves the file where it is.
+      const retry = await renameOntoTaken(projectId, ownerId, otherId, 4);
+      expect(retry.outcome).toMatchObject({ finalPath: 'pic.conflict-B-2.png' });
+      expect(await disk(projectId, 'pic.conflict-B-2.png')).toBe('other bytes');
+    });
+
+    it('a conflict RENAME clears a tombstone at the conflict name, as at a plain target', async () => {
+      const { projectId, ownerId, copy, otherId } = await takenName();
+      await applyOperation(
+        { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 3 } },
+        { opType: 'DELETE', filePath: copy.finalPath, payload: { fileId: copy.fileId } },
+      );
+
+      const renamed = await renameOntoTaken(projectId, ownerId, otherId, 4);
+      expect(renamed.outcome).toMatchObject({ finalPath: 'pic.conflict-B.png' });
+      expect(await disk(projectId, 'pic.conflict-B.png')).toBe('other bytes');
+      const row = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: otherId } });
+      expect(row.path).toBe('pic.conflict-B.png');
+      expect(await testPrisma.vaultFile.findUnique({ where: { id: copy.fileId } })).toBeNull();
+    });
   });
 
   it('renames over a soft-deleted tombstone at the target path', async () => {
