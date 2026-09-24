@@ -84,6 +84,12 @@ sudo fail2ban-client status caddy-nextjs-action
 в `/etc/systemd/system/team-vault-prune-backups.service`. Нужно хранить дольше —
 держите вне этого каталога.
 
+Возраст считается по mtime **каждого** файла, а не по дате бэкапа. Поэтому
+копируйте без сохранения времени: `install -m 0644 <файл> <куда>`, `cp` без
+`-a`/`-p`, архив `tar`. Копия, сделанная `cp -a` (или `rsync -a`) с файла,
+который не менялся больше 30 суток, удалится при ближайшем прогоне таймера. У
+каталога, скопированного так, пропадут старые файлы.
+
 ```bash
 sudo team-vault-prune-backups --dry-run
 ```
@@ -111,18 +117,46 @@ sudo bash /opt/team-vault/scripts/upgrade.sh
 `/etc/caddy/Caddyfile` он **не трогает**. Если в обновлении изменился
 `config/Caddyfile.example` (там же живут заголовки безопасности: HSTS на год без
 `preload`, запрет фрейминга, `nosniff`, `Referrer-Policy`, `Permissions-Policy`),
-перегенерируйте Caddyfile сами, с теми же значениями, что при установке:
+перегенерируйте Caddyfile сами, с теми же значениями, что при установке.
+
+`EXTRA_DOMAINS` — это `MIRROR_DOMAINS` из установки в том виде, в каком его
+собирает `install.sh`: перед каждым зеркалом `, `. Например,
+`MIRROR_DOMAINS=a.example.com,b.example.com` превращается в
+`EXTRA_DOMAINS=', a.example.com, b.example.com'`; без зеркал —
+`EXTRA_DOMAINS=''`. Ошибка здесь даёт другой, но синтаксически верный адрес
+сайта, и `caddy validate` её не поймает. Поэтому первым делом сверьте адрес
+сайта с действующим:
 
 ```bash
 cd /opt/team-vault
-sudo cp -a /etc/caddy/Caddyfile /var/backups/team-vault/Caddyfile.before-$(date +%F)
-DOMAIN=sync.example.com EXTRA_DOMAINS='' PORT_WEB=3000 PORT_SOCKET=3001 \
+DOMAIN=sync.example.com EXTRA_DOMAINS=', mirror.example.com' \
+  PORT_WEB=3000 PORT_SOCKET=3001 \
   envsubst '${DOMAIN} ${EXTRA_DOMAINS} ${PORT_WEB} ${PORT_SOCKET}' \
   < config/Caddyfile.example > /tmp/Caddyfile.new
+# Адрес сайта — первая строка без отступа и не комментарий. Должно напечатать
+# «адрес сайта совпадает»; иначе исправьте EXTRA_DOMAINS и отрендерите заново.
+diff <(grep -m1 '^[^#[:space:]]' /etc/caddy/Caddyfile) \
+     <(grep -m1 '^[^#[:space:]]' /tmp/Caddyfile.new) && echo 'адрес сайта совпадает'
 diff -u /etc/caddy/Caddyfile /tmp/Caddyfile.new    # только ожидаемые строки
-sudo caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
-sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
+
+Если разница — только ожидаемые строки, сделайте бэкап, проверьте и примените
+новый файл. Цепочка через `&&` останавливается на первой ошибке: без бэкапа или
+с невалидным файлом Caddy не перезагрузится.
+
+```bash
+BACKUP=/var/backups/team-vault/Caddyfile.before-$(date +%F-%H%M%S)
+sudo install -d -m 0750 /var/backups/team-vault \
+  && sudo install -m 0644 /etc/caddy/Caddyfile "$BACKUP" \
+  && sudo caddy validate --config /tmp/Caddyfile.new --adapter caddyfile \
+  && sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile \
+  && sudo systemctl reload caddy \
+  && echo "применено, бэкап: $BACKUP"
+```
+
+Бэкап копируется `install`, а не `cp -a`, чтобы у копии был сегодняшний mtime
+(см. «Бэкапы» выше). Время в имени с точностью до секунды не даёт повторному
+заходу в тот же день затереть оригинал.
 
 ### Удаление
 
