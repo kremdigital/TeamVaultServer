@@ -103,6 +103,28 @@ describe('GET /api/projects/[id]/files — фильтры path и prefix', () =>
     expect(await list(plain, projectId, '?path=нет-такого.md')).toEqual([]);
   });
 
+  it('path находит файл в любом написании, которое POST сохранил бы так же', async () => {
+    const { projectId, user, plain } = await seedOwnerWithKey();
+    await seedFile(projectId, user.id, 'персонажи/минин.md');
+
+    // write_note в MCP резолвит путь этим запросом перед созданием: без
+    // нормализации он не находил существующую заметку и получал 409.
+    for (const spelling of ['персонажи//минин.md', 'персонажи\\минин.md', './персонажи/минин.md']) {
+      expect(
+        await list(plain, projectId, `?path=${encodeURIComponent(spelling)}`),
+        spelling,
+      ).toEqual(['персонажи/минин.md']);
+    }
+  });
+
+  it('path, который гейт путей отвергает, — пустой массив, а не ошибка', async () => {
+    const { projectId, user, plain } = await seedOwnerWithKey();
+    await seedFile(projectId, user.id, 'a.md');
+
+    expect(await list(plain, projectId, `?path=${encodeURIComponent('../a.md')}`)).toEqual([]);
+    expect(await list(plain, projectId, `?path=${encodeURIComponent('/a.md')}`)).toEqual([]);
+  });
+
   it('prefix отдаёт поддерево', async () => {
     const { projectId, user, plain } = await seedOwnerWithKey();
     await seedFile(projectId, user.id, 'персонажи/минин.md');

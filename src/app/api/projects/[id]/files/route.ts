@@ -34,8 +34,26 @@ export async function GET(
   // `{ files: [...] }` и на несуществующем пути отдаёт пустой массив, а не 404:
   // вызывающему проще отличить «нет файла» от «нет проекта», а клиенты,
   // проверяющие отсутствие пути перед созданием, не ломаются.
-  const pathFilter = url.searchParams.get('path');
+  const rawPath = url.searchParams.get('path');
   const prefixFilter = url.searchParams.get('prefix');
+
+  // Тот же путь, что сохранили бы POST и PATCH: они пропускают его через
+  // normalizeVaultPath (`dir//x.md`, `dir\x.md`, `./x.md` → `dir/x.md`, `x.md`).
+  // Без этого клиент, передавший путь в другом написании, не находил
+  // существующий файл: write_note в MCP получал 409 path_exists вместо
+  // обновления, read_note — «Note not found». allowClientDirs — как у всех
+  // чтений: строка могла быть сохранена до запрета клиентских папок. Путь,
+  // который гейт отвергает, в БД храниться не может — это пустой ответ, как
+  // для несуществующего файла.
+  let pathFilter: string | null = null;
+  if (rawPath) {
+    try {
+      pathFilter = normalizeVaultPath(rawPath, { allowClientDirs: true });
+    } catch (err) {
+      if (err instanceof InvalidPathError) return NextResponse.json({ files: [] });
+      throw err;
+    }
+  }
 
   const files = await prisma.vaultFile.findMany({
     where: {
