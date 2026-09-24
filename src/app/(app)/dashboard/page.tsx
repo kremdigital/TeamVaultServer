@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import { FolderIcon, PlusIcon } from 'lucide-react';
 import { toast } from 'sonner';
@@ -34,6 +35,7 @@ interface ProjectListItem {
 
 export default function DashboardPage() {
   const t = useTranslations('dashboard');
+  const router = useRouter();
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
@@ -107,7 +109,7 @@ export default function DashboardPage() {
           onCreated={(id) => {
             setCreateOpen(false);
             void load();
-            window.location.assign(`/projects/${id}`);
+            router.push(`/projects/${id}`);
           }}
         />
       )}
