@@ -54,6 +54,49 @@ export function isWindowsAlias(segment: string): boolean {
   return shortName !== null && (shortName[1] ?? '').length <= 8;
 }
 
+/**
+ * Characters a Windows disk can't hold in a name (`:` is covered by
+ * `isWindowsAlias`), control characters included; NUL is refused earlier.
+ */
+const WINDOWS_FORBIDDEN_CHARS = /[*?<>"|\u0001-\u001f]/;
+
+/**
+ * True for a name a Windows client can't keep as spelled: an alias
+ * (`isWindowsAlias`), a forbidden character, or a trailing dot or space —
+ * Windows drops those, so `Notes.` and `Notes` are one folder there. Obsidian
+ * allows most of these on macOS and Linux; the plugin (0.3.8) refuses them in
+ * both directions so that no device uploads a name another can't write, and
+ * the server refuses them for every client.
+ */
+export function isUnsafeForWindows(segment: string): boolean {
+  return isWindowsAlias(segment) || WINDOWS_FORBIDDEN_CHARS.test(segment) || /[. ]$/.test(segment);
+}
+
+/**
+ * Code points HFS+ skips when it compares names, so there `.obs<U+200C>idian`
+ * IS `.obsidian` (git's list, CVE-2014-9390).
+ */
+const HFS_IGNORABLE = /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g;
+
+/**
+ * The key two names that some client file system opens as the same folder
+ * share — the plugin's `nameKey` (src/watcher/path-utils.ts in
+ * TeamVaultPlugin): compatibility forms merged (`．obsidian`), full Unicode case
+ * folding like case-insensitive APFS (`.obſidian` is `.obsidian`, `ß` is `ss`),
+ * the code points HFS+ skips removed. Lower, upper and lower again gets full
+ * case folding out of the built-in string functions.
+ */
+export function nameKey(segment: string): string {
+  return segment
+    .normalize('NFKC')
+    .normalize('NFD')
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .replace(HFS_IGNORABLE, '')
+    .normalize('NFC');
+}
+
 /** A content hash must be a bare 64-char lowercase hex string — used as a
  *  filename in the staging area, so it must never contain path separators. */
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -99,13 +142,19 @@ export function normalizeVaultPath(input: string, opts: NormalizeOptions = {}): 
     if (RESERVED_STORAGE_NAMES.has(lower)) {
       throw new InvalidPathError(`Reserved folder name: ${segment}`);
     }
-    if (!opts.allowClientDirs && RESERVED_CLIENT_NAMES.has(lower)) {
-      throw new InvalidPathError(`Reserved folder name: ${segment}`);
-    }
-    // Only for paths a client creates or moves to: a row stored before this
-    // rule must stay readable and removable, like the client folders above.
-    if (!opts.allowClientDirs && isWindowsAlias(segment)) {
-      throw new InvalidPathError(`Name Windows resolves to another file: ${segment}`);
+    // The rest only for paths a client creates or moves to: a row stored
+    // before a rule must stay readable, renamable and removable.
+    if (!opts.allowClientDirs) {
+      // Compared the way client disks compare names (`nameKey`): otherwise
+      // `.obſidian/…` or `．git/…` passes here and a Mac opens the real folder.
+      const key = nameKey(segment);
+      if (key === '') throw new InvalidPathError('Empty path segment');
+      if (RESERVED_STORAGE_NAMES.has(key) || RESERVED_CLIENT_NAMES.has(key)) {
+        throw new InvalidPathError(`Reserved folder name: ${segment}`);
+      }
+      if (isUnsafeForWindows(segment)) {
+        throw new InvalidPathError(`Name a Windows client can't keep: ${segment}`);
+      }
     }
     if (segment.length > 255) throw new InvalidPathError('Path segment too long');
   }

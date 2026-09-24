@@ -88,6 +88,42 @@ describe('normalizeVaultPath', () => {
     }
   });
 
+  it('rejects names a Windows client cannot keep, on incoming paths', () => {
+    for (const path of [
+      'Why?.md',
+      'a*b.md',
+      'a<b.md',
+      'a>b.md',
+      'a"b.md',
+      'a|b.md',
+      'x\u0001.md',
+      'Notes./x.md',
+      'Notes /x.md',
+      'note.md.',
+    ]) {
+      expect(() => normalizeVaultPath(path), JSON.stringify(path)).toThrow(InvalidPathError);
+      expect(normalizeVaultPath(path, { allowClientDirs: true }), JSON.stringify(path)).toBe(path);
+    }
+  });
+
+  it('rejects client folders spelled the way a Mac or a NAS opens as the real one', () => {
+    for (const path of [
+      '.obſidian/plugins/team-vault/data.json',
+      '．git/hooks/pre-commit',
+      '.ＧＩＴ/config',
+      '.tra\u200Csh/x.md',
+    ]) {
+      expect(() => normalizeVaultPath(path), JSON.stringify(path)).toThrow(InvalidPathError);
+    }
+    expect(() => normalizeVaultPath('\u200C\uFEFF/x.md')).toThrow(InvalidPathError);
+  });
+
+  it('keeps ordinary names with non-ASCII letters', () => {
+    expect(normalizeVaultPath('Straße/Übersicht.md')).toBe('Straße/Übersicht.md');
+    expect(normalizeVaultPath('заметки/Ёлка.md')).toBe('заметки/Ёлка.md');
+    expect(normalizeVaultPath('日記/メモ.md')).toBe('日記/メモ.md');
+  });
+
   it('keeps names that only look like a Windows short name', () => {
     // Longer than 8 before the `~`, or `~` not followed by digits only.
     expect(normalizeVaultPath('Chapter~1.md')).toBe('Chapter~1.md');
