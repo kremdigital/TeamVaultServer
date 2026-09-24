@@ -108,6 +108,22 @@ sudo bash /opt/team-vault/scripts/upgrade.sh
 миграции, пересобирает приложение и делает `pm2 reload --update-env`
 (zero-downtime).
 
+`/etc/caddy/Caddyfile` он **не трогает**. Если в обновлении изменился
+`config/Caddyfile.example` (там же живут заголовки безопасности: HSTS на год без
+`preload`, запрет фрейминга, `nosniff`, `Referrer-Policy`, `Permissions-Policy`),
+перегенерируйте Caddyfile сами, с теми же значениями, что при установке:
+
+```bash
+cd /opt/team-vault
+sudo cp -a /etc/caddy/Caddyfile /var/backups/team-vault/Caddyfile.before-$(date +%F)
+DOMAIN=sync.example.com EXTRA_DOMAINS='' PORT_WEB=3000 PORT_SOCKET=3001 \
+  envsubst '${DOMAIN} ${EXTRA_DOMAINS} ${PORT_WEB} ${PORT_SOCKET}' \
+  < config/Caddyfile.example > /tmp/Caddyfile.new
+diff -u /etc/caddy/Caddyfile /tmp/Caddyfile.new    # только ожидаемые строки
+sudo caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
+sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo systemctl reload caddy
+```
+
 ### Удаление
 
 ```bash
@@ -150,9 +166,13 @@ pm2 start ecosystem.config.cjs
 pm2 save
 pm2 startup systemd
 
-# 8. Caddy
-sudo cp config/Caddyfile.example /etc/caddy/Caddyfile
-sudo sed -i 's/{$DOMAIN}/sync.example.com/' /etc/caddy/Caddyfile
+# 8. Caddy — шаблон рендерится тем же envsubst, что и в install.sh
+#    (пакет gettext-base). EXTRA_DOMAINS — зеркала с ведущей запятой, например
+#    ', mirror.example.com'; без зеркал — пустая строка.
+DOMAIN=sync.example.com EXTRA_DOMAINS='' PORT_WEB=3000 PORT_SOCKET=3001 \
+  envsubst '${DOMAIN} ${EXTRA_DOMAINS} ${PORT_WEB} ${PORT_SOCKET}' \
+  < config/Caddyfile.example | sudo tee /etc/caddy/Caddyfile > /dev/null
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 ```
 
