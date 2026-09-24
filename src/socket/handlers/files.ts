@@ -60,6 +60,15 @@ async function withEditAccess(
   return { ok: true, userId, role: user.role };
 }
 
+/**
+ * Every `file:*` broadcast goes to the whole room, the sender included, and
+ * carries the author's `clientId` (the one the operation came with). That is how
+ * a client recognises its own operation coming back — e.g. the intermediate
+ * steps of its own offline rename chain — and doesn't apply it over a newer
+ * local state. REST writes carry the pseudo client `rest:<userId>` (see
+ * `rest-bridge.ts`). The value is what the client declared, not verified, so it
+ * is a hint for skipping an echo, never a reason to drop someone's change.
+ */
 export function attachFileHandlers(io: Server, socket: Socket): void {
   const log = child({ socket: socket.id, userId: getSocketUser(socket).userId });
 
@@ -100,6 +109,7 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       }
       io.to(projectRoom(raw.projectId)).emit('file:created', {
         result,
+        clientId: raw.clientId,
         log: serializeLog(result.log),
       });
 
@@ -168,6 +178,7 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       io.to(projectRoom(raw.projectId)).emit('file:updated-binary', {
         fileId: raw.fileId,
         contentHash: raw.contentHash,
+        clientId: raw.clientId,
         log: serializeLog(result.log),
       });
       ack({ ok: true, outcome: result.outcome });
@@ -193,6 +204,7 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       );
       io.to(projectRoom(raw.projectId)).emit('file:deleted', {
         fileId: raw.fileId,
+        clientId: raw.clientId,
         log: serializeLog(result.log),
       });
       ack({ ok: true, outcome: result.outcome });
@@ -228,9 +240,18 @@ async function handleMove(
       },
       { opType, filePath: raw.filePath, newPath: raw.newPath, payload: { fileId: raw.fileId } },
     );
+    // `newPath` is where the server actually put the file, not what the client
+    // asked for: a target taken by another file sends it to
+    // `<path>.conflict-<clientId>`, and the path is normalized. Broadcasting the
+    // requested path made every client move its copy to a name the server
+    // doesn't have (onto the file that won the name, if it had one), so the
+    // vaults diverged from the server. The request stays readable as
+    // `requestedPath`.
     io.to(projectRoom(raw.projectId)).emit(opType === 'RENAME' ? 'file:renamed' : 'file:moved', {
       fileId: raw.fileId,
-      newPath: raw.newPath,
+      newPath: result.log.newPath ?? raw.newPath,
+      requestedPath: raw.newPath,
+      clientId: raw.clientId,
       outcome: result.outcome,
       log: serializeLog(result.log),
     });

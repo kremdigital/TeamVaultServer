@@ -67,6 +67,31 @@ describe('buildEventPayload', () => {
     expect(p.newPath).toBe('путь.md');
   });
 
+  it('каждое событие несёт автора — псевдоклиента rest:<userId>', () => {
+    // По clientId клиент узнаёт эхо своей операции и не применяет его поверх
+    // более нового локального состояния. Форма обязана совпадать с сокетными
+    // событиями, где это clientId автора операции.
+    const events: OperationNotification['event'][] = [
+      'file:created',
+      'file:updated-binary',
+      'file:deleted',
+      'file:renamed',
+      'file:moved',
+    ];
+    for (const event of events) {
+      const p = buildEventPayload(note({ event, newPath: 'стало.md' }), log);
+      expect(p.clientId, `событие ${event} без clientId`).toBe('rest:u');
+    }
+  });
+
+  it('file:renamed/moved — requestedPath совпадает с newPath: REST не уводит в conflict-копию', () => {
+    for (const event of ['file:renamed', 'file:moved'] as const) {
+      const p = buildEventPayload(note({ event, path: 'было.md', newPath: 'стало.md' }), log);
+      expect(p.newPath).toBe('стало.md');
+      expect(p.requestedPath).toBe('стало.md');
+    }
+  });
+
   it('ни одно событие не остаётся без fileId', () => {
     const events: OperationNotification['event'][] = [
       'file:created',

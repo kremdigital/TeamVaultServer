@@ -35,23 +35,32 @@ export function buildEventPayload(
   note: OperationNotification,
   log: SerializedLog,
 ): Record<string, unknown> {
+  // `clientId` — автор операции, как у сокетных событий: у REST это псевдоклиент
+  // `rest:<userId>`. По нему клиент узнаёт своё эхо; здесь своих у плагина нет,
+  // но поле обязано быть в каждом `file:*`, чтобы формы не расходились.
+  const clientId = note.clientId;
   switch (note.event) {
     case 'file:created':
       // Плагин достаёт fileId и path из `result.outcome`.
       return {
         result: { outcome: { kind: 'created', fileId: note.fileId, path: note.path } },
+        clientId,
         log,
       };
     case 'file:updated-binary':
-      return { fileId: note.fileId, contentHash: note.contentHash ?? '', log };
+      return { fileId: note.fileId, contentHash: note.contentHash ?? '', clientId, log };
     case 'file:deleted':
-      return { fileId: note.fileId, log };
+      return { fileId: note.fileId, clientId, log };
     case 'file:renamed':
     case 'file:moved': {
+      // REST не уводит файл в conflict-копию (занятый путь — это 409), поэтому
+      // сохранённый путь и запрошенный совпадают.
       const target = note.newPath ?? note.path;
       return {
         fileId: note.fileId,
         newPath: target,
+        requestedPath: target,
+        clientId,
         outcome: { kind: 'moved', fileId: note.fileId, path: target },
         log,
       };

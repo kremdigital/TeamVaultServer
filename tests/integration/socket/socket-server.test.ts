@@ -660,3 +660,251 @@ describe('web ↔ plugin instant sync', () => {
     replica.destroy();
   });
 });
+
+/** Wait for the next `event` on `socket`, or the next one `pick` accepts. */
+function nextEvent<T>(
+  socket: ClientSocket,
+  event: string,
+  pick?: (data: T) => boolean,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off(event, onEvent);
+      reject(new Error(`no ${event} broadcast`));
+    }, 5000);
+    function onEvent(data: T) {
+      if (pick && !pick(data)) return;
+      clearTimeout(timer);
+      socket.off(event, onEvent);
+      resolve(data);
+    }
+    socket.on(event, onEvent);
+  });
+}
+
+/** Owner A and editor B of one project, both connected and in the room. */
+async function twoMembersInRoom() {
+  const { userId: aId, plainKey: aKey } = await bootstrapUserAndKey('A');
+  const project = await createProject(aId);
+  const { userId: bId, plainKey: bKey } = await bootstrapUserAndKey('B');
+  await testPrisma.projectMember.create({
+    data: { projectId: project.id, userId: bId, role: 'EDITOR', addedById: aId },
+  });
+  const a = connect(aKey);
+  const b = connect(bKey);
+  await Promise.all([
+    new Promise<void>((r) => a.on('connect', () => r())),
+    new Promise<void>((r) => b.on('connect', () => r())),
+  ]);
+  await emitWithAck(a, 'project:join', { projectId: project.id });
+  await emitWithAck(b, 'project:join', { projectId: project.id });
+  return { projectId: project.id, a, b };
+}
+
+type FileEventPayload = {
+  clientId?: string;
+  fileId?: string;
+  newPath?: string;
+  requestedPath?: string;
+  result?: { outcome?: { fileId?: string } };
+};
+
+describe('file:* broadcasts (contract with the plugin)', () => {
+  it('carry the author clientId on every event, to the sender as well', async () => {
+    // A client recognises its own operation coming back by `clientId` (e.g. the
+    // intermediate steps of its offline rename chain) and must not apply it over
+    // a newer local state. Without the field it can't tell.
+    const { projectId, a, b } = await twoMembersInRoom();
+    const envelope = { projectId, clientId: 'client-A' };
+
+    const created = Promise.all([
+      nextEvent<FileEventPayload>(b, 'file:created'),
+      nextEvent<FileEventPayload>(a, 'file:created'),
+    ]);
+    const ack = await emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+      ...envelope,
+      filePath: 'pic.png',
+      fileType: 'BINARY',
+      contentHash: 'h1',
+      size: 3,
+      data: [1, 2, 3],
+    });
+    const fileId = ack.outcome.fileId;
+    for (const e of await created) {
+      expect(e.clientId).toBe('client-A');
+      expect(e.result?.outcome?.fileId).toBe(fileId);
+    }
+
+    const updated = nextEvent<FileEventPayload>(b, 'file:updated-binary');
+    await emitWithAck(a, 'file:update-binary', {
+      ...envelope,
+      fileId,
+      contentHash: 'h2',
+      size: 2,
+      data: [4, 5],
+    });
+    expect((await updated).clientId).toBe('client-A');
+
+    const renamed = nextEvent<FileEventPayload>(b, 'file:renamed');
+    await emitWithAck(a, 'file:rename', {
+      ...envelope,
+      fileId,
+      filePath: 'pic.png',
+      newPath: 'pic-2.png',
+    });
+    expect(await renamed).toMatchObject({ clientId: 'client-A', newPath: 'pic-2.png' });
+
+    const moved = nextEvent<FileEventPayload>(b, 'file:moved');
+    await emitWithAck(a, 'file:move', {
+      ...envelope,
+      fileId,
+      filePath: 'pic-2.png',
+      newPath: 'img/pic-2.png',
+    });
+    expect(await moved).toMatchObject({ clientId: 'client-A', newPath: 'img/pic-2.png' });
+
+    const deleted = nextEvent<FileEventPayload>(b, 'file:deleted');
+    await emitWithAck(a, 'file:delete', { ...envelope, fileId, filePath: 'img/pic-2.png' });
+    expect(await deleted).toMatchObject({ clientId: 'client-A', fileId });
+  });
+
+  it('file:renamed after a conflict rename carries the stored path, the request as requestedPath', async () => {
+    // The server sends a rename onto a taken name to `<path>.conflict-<clientId>`.
+    // Broadcasting the requested name moved every client's copy onto the file
+    // that won the name, and the vaults diverged from the server.
+    const { projectId, a, b } = await twoMembersInRoom();
+    const create = (filePath: string, text: string) =>
+      emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+        projectId,
+        clientId: 'client-A',
+        filePath,
+        fileType: 'TEXT',
+        contentHash: `h-${filePath}`,
+        size: text.length,
+        data: Array.from(Buffer.from(text)),
+      });
+    const moving = await create('a.md', 'a\n');
+    await create('target.md', 'target\n');
+
+    const toB = nextEvent<FileEventPayload>(b, 'file:renamed');
+    const toSender = nextEvent<FileEventPayload>(a, 'file:renamed');
+    const ack = await emitWithAck<{ ok: true; outcome: { kind: string; finalPath: string } }>(
+      a,
+      'file:rename',
+      {
+        projectId,
+        clientId: 'client-A',
+        fileId: moving.outcome.fileId,
+        filePath: 'a.md',
+        newPath: 'target.md',
+      },
+    );
+    expect(ack.outcome).toMatchObject({
+      kind: 'conflict_create_renamed',
+      finalPath: 'target.conflict-client-A.md',
+    });
+
+    const row = await testPrisma.vaultFile.findUniqueOrThrow({
+      where: { id: moving.outcome.fileId },
+    });
+    expect(row.path).toBe('target.conflict-client-A.md');
+    for (const e of [await toB, await toSender]) {
+      expect(e).toMatchObject({
+        fileId: moving.outcome.fileId,
+        newPath: 'target.conflict-client-A.md',
+        requestedPath: 'target.md',
+        clientId: 'client-A',
+      });
+    }
+  });
+
+  it('file:moved carries the normalized path the server stored', async () => {
+    const { projectId, a, b } = await twoMembersInRoom();
+    const created = await emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+      projectId,
+      clientId: 'client-A',
+      filePath: 'n.md',
+      fileType: 'TEXT',
+      contentHash: 'h',
+      size: 2,
+      data: Array.from(Buffer.from('n\n')),
+    });
+    const moved = nextEvent<FileEventPayload>(b, 'file:moved');
+    await emitWithAck(a, 'file:move', {
+      projectId,
+      clientId: 'client-A',
+      fileId: created.outcome.fileId,
+      filePath: 'n.md',
+      newPath: 'dir//n.md',
+    });
+    expect(await moved).toMatchObject({ newPath: 'dir/n.md', requestedPath: 'dir//n.md' });
+  });
+
+  it('CREATE on a tombstone: a peer holding the old history converges to exactly the new text', async () => {
+    // The note is deleted and created again under the same name ("Untitled").
+    // The server revives the same fileId; a peer that still holds the note's old
+    // history (online 0.3.7, or an offline device on its catch-up) merges the
+    // state the server broadcasts. With the history replaced by buildInitialState
+    // the peer got "old text + new text" and sent it back to everyone.
+    const { projectId, a, b } = await twoMembersInRoom();
+    const OLD = 'old text\n';
+    const NEW = 'new note\n';
+    const createUntitled = (text: string, hash: string) =>
+      emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+        projectId,
+        clientId: 'client-A',
+        filePath: 'Untitled.md',
+        fileType: 'TEXT',
+        contentHash: hash,
+        size: text.length,
+        data: Array.from(Buffer.from(text)),
+      });
+
+    const seeded = nextEvent<{ fileId: string; update: number[] }>(b, 'yjs:update');
+    const first = await createUntitled(OLD, 'h-old');
+    const fileId = first.outcome.fileId;
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Uint8Array.from((await seeded).update));
+
+    // B edits the note; the server merges the edit into the history.
+    const sv = Y.encodeStateVector(peer);
+    peer.getText(TEXT_KEY).insert(OLD.length, 'edit\n');
+    await emitWithAck(b, 'yjs:update', {
+      projectId,
+      fileId,
+      update: Array.from(Y.encodeStateAsUpdate(peer, sv)),
+    });
+
+    const deleted = nextEvent<FileEventPayload>(b, 'file:deleted');
+    await emitWithAck(a, 'file:delete', {
+      projectId,
+      clientId: 'client-A',
+      fileId,
+      filePath: 'Untitled.md',
+    });
+    await deleted;
+
+    const revivedState = nextEvent<{ fileId: string; update: number[] }>(
+      b,
+      'yjs:update',
+      (m) => m.fileId === fileId,
+    );
+    const again = await createUntitled(NEW, 'h-new');
+    expect(again.outcome.fileId).toBe(fileId);
+
+    Y.applyUpdate(peer, Uint8Array.from((await revivedState).update));
+    expect(peer.getText(TEXT_KEY).toString()).toBe(NEW);
+
+    // The peer pushes whatever the server lacks; the note stays the new text.
+    const row = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    await emitWithAck(b, 'yjs:update', {
+      projectId,
+      fileId,
+      update: Array.from(Y.encodeStateAsUpdate(peer, new Uint8Array(row.stateVector))),
+    });
+    const stored = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const server = new Y.Doc();
+    Y.applyUpdate(server, new Uint8Array(stored.state));
+    expect(server.getText(TEXT_KEY).toString()).toBe(NEW);
+  });
+});
