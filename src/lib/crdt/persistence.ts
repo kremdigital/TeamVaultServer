@@ -210,6 +210,11 @@ function uint8Equal(a: Uint8Array, b: Uint8Array): boolean {
  * Build a Y.Doc seeded from an external source (e.g. existing .md file content)
  * and return its initial encoded state. Useful when a binary file is converted
  * to a CRDT-managed text file for the first time.
+ *
+ * Only for a file that has NO stored doc yet. Never write the result over an
+ * existing `YjsDocument`: that swaps the history for an independent one, and a
+ * client still holding the old history merges both texts (duplication). Use
+ * {@link writeYjsText} there.
  */
 export function buildInitialState(text: string): {
   state: Uint8Array;
@@ -221,6 +226,69 @@ export function buildInitialState(text: string): {
   const stateVector = Y.encodeStateVector(doc);
   doc.destroy();
   return { state, stateVector };
+}
+
+/**
+ * Привести сохранённое состояние Y.Doc к тексту `text`, **продолжая** его
+ * историю: удалить весь прежний текст и вставить новый поверх, в одной
+ * транзакции. Если текст уже совпадает, история не трогается (`changed: false`).
+ * Без сохранённого состояния (`stored` пуст) получается свежий документ — то же,
+ * что {@link buildInitialState}.
+ *
+ * ⚠️ Существующий документ нельзя подменять свежим (`buildInitialState`). У
+ * свежего документа своя, независимая история: клиент, который хранит прежнюю
+ * (в y-indexeddb, в открытом редакторе), при слиянии получает ОБА текста —
+ * старый и новый подряд, и отправляет задвоение всей команде. Это механизм
+ * инцидентов задвоения 2026-08-03 и оживления тумбстоуна (ревью 0.3.8). Удаление
+ * прежнего текста, записанное в историю, клиент со старой историей применяет и
+ * сходится ровно к `text`.
+ */
+export function extendYjsState(
+  stored: Uint8Array | null | undefined,
+  text: string,
+): { state: Uint8Array; stateVector: Uint8Array; changed: boolean } {
+  const doc = new Y.Doc();
+  try {
+    if (stored && stored.length > 0) Y.applyUpdate(doc, stored);
+    const ytext = doc.getText(TEXT_KEY);
+    const changed = ytext.toString() !== text;
+    if (changed) {
+      doc.transact(() => {
+        ytext.delete(0, ytext.length);
+        ytext.insert(0, text);
+      });
+    }
+    return {
+      state: Y.encodeStateAsUpdate(doc),
+      stateVector: Y.encodeStateVector(doc),
+      changed,
+    };
+  } finally {
+    doc.destroy();
+  }
+}
+
+/**
+ * Записать текст в `YjsDocument` файла через {@link extendYjsState}: существующая
+ * история продолжается, а не заменяется. Строка создаётся, если её не было;
+ * если текст уже совпадает, строка не переписывается.
+ */
+export async function writeYjsText(fileId: string, text: string): Promise<{ changed: boolean }> {
+  const stored = await prisma.yjsDocument.findUnique({
+    where: { fileId },
+    select: { state: true },
+  });
+  const previous = stored?.state && stored.state.length > 0 ? new Uint8Array(stored.state) : null;
+  const next = extendYjsState(previous, text);
+  if (previous && !next.changed) return { changed: false };
+  const state = Buffer.from(next.state);
+  const stateVector = Buffer.from(next.stateVector);
+  await prisma.yjsDocument.upsert({
+    where: { fileId },
+    create: { fileId, state, stateVector },
+    update: { state, stateVector },
+  });
+  return { changed: next.changed };
 }
 
 export function hashText(text: string): string {

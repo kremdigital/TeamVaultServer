@@ -2,6 +2,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
+import { applyYjsUpdate, TEXT_KEY } from '@/lib/crdt/persistence';
 import {
   appendConflictSuffix,
   applyOperation,
@@ -217,6 +219,220 @@ describe('applyOperation: CREATE', () => {
       orderBy: { path: 'asc' },
     });
     expect(files.map((f) => f.path)).toEqual(['collide.conflict-client-B.md', 'collide.md']);
+  });
+});
+
+/**
+ * CREATE on a path that holds a tombstone brings back the SAME fileId. Its Y.Doc
+ * history must be extended (old text deleted, new text inserted on top), not
+ * replaced by an independent `buildInitialState` doc: a device that was away
+ * while the note was deleted and re-created ("Untitled", a template, restore
+ * from trash) still holds the old history under that id, and merging two
+ * independent histories of one note sends the duplicated text to the whole team
+ * (review 0.3.8, lens "upgrade" #1 / "engine" #4).
+ */
+describe('applyOperation: CREATE on a tombstone extends the Y.Doc history', () => {
+  const OLD = 'Old line one\nOld line two\n';
+  const NEW = 'Brand new note\n';
+
+  async function storedState(fileId: string): Promise<Uint8Array> {
+    const row = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    return new Uint8Array(row.state);
+  }
+
+  function textOf(state: Uint8Array): string {
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, state);
+    const text = doc.getText(TEXT_KEY).toString();
+    doc.destroy();
+    return text;
+  }
+
+  /**
+   * A synced note `a.md` and a device holding its history, including an edit the
+   * device made and the server merged — the doc y-indexeddb keeps on the device.
+   */
+  async function noteWithDeviceHistory(projectId: string, ownerId: string) {
+    const created = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-old', size: OLD.length },
+        data: Buffer.from(OLD),
+      },
+    );
+    if (created.outcome.kind !== 'created') throw new Error('expected created');
+    const fileId = created.outcome.fileId;
+
+    const device = new Y.Doc();
+    Y.applyUpdate(device, await storedState(fileId));
+    const before = Y.encodeStateVector(device);
+    device.getText(TEXT_KEY).insert(OLD.length, 'edit\n');
+    await applyYjsUpdate({
+      fileId,
+      update: Y.encodeStateAsUpdate(device, before),
+      authorId: ownerId,
+    });
+    expect(textOf(await storedState(fileId))).toBe(`${OLD}edit\n`);
+    return { fileId, device };
+  }
+
+  it('a device holding the pre-delete history converges to exactly the new text', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const { fileId, device } = await noteWithDeviceHistory(projectId, ownerId);
+
+    // The device is closed. A teammate deletes a.md, then creates a new a.md.
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 1 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+    const revived = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-new', size: NEW.length },
+        data: Buffer.from(NEW),
+      },
+    );
+    expect(revived.outcome).toEqual({ kind: 'created', fileId, path: 'a.md' });
+    expect(revived.log.payload).toMatchObject({ fileId, revived: true });
+
+    // The device comes back: catch-up applies the server's state to its doc,
+    // then the device pushes what the server lacks by its state vector.
+    const serverState = await storedState(fileId);
+    expect(textOf(serverState)).toBe(NEW);
+    Y.applyUpdate(device, serverState);
+    expect(device.getText(TEXT_KEY).toString()).toBe(NEW);
+
+    const serverVector = new Uint8Array(
+      (await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } })).stateVector,
+    );
+    await applyYjsUpdate({
+      fileId,
+      update: Y.encodeStateAsUpdate(device, serverVector),
+      authorId: ownerId,
+    });
+    // Was "Brand new note\nOld line one\nOld line two\nedit\n" (or the reverse)
+    // for the whole team with the history replaced by buildInitialState.
+    expect(textOf(await storedState(fileId))).toBe(NEW);
+  });
+
+  it('restoring the same text (from the trash) does not double it', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const { fileId, device } = await noteWithDeviceHistory(projectId, ownerId);
+    const same = `${OLD}edit\n`;
+
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 1 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-same', size: same.length },
+        data: Buffer.from(same),
+      },
+    );
+
+    Y.applyUpdate(device, await storedState(fileId));
+    expect(device.getText(TEXT_KEY).toString()).toBe(same);
+    expect(textOf(await storedState(fileId))).toBe(same);
+  });
+
+  it('a tombstone without a stored Y.Doc gets a fresh one with the new text', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const created = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-old', size: OLD.length },
+        data: Buffer.from(OLD),
+      },
+    );
+    if (created.outcome.kind !== 'created') throw new Error('expected created');
+    const fileId = created.outcome.fileId;
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 2 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+    await testPrisma.yjsDocument.delete({ where: { fileId } });
+
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 3 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-new', size: NEW.length },
+        data: Buffer.from(NEW),
+      },
+    );
+    expect(textOf(await storedState(fileId))).toBe(NEW);
+  });
+
+  it('a retried conflict CREATE with new content extends the conflict copy history', async () => {
+    // The same client re-sends a CREATE for a path still held by another file:
+    // the row at `<path>.conflict-<clientId>` is live and keeps its id, and
+    // clients already hold its first history (the server broadcast it).
+    const { projectId, ownerId } = await seedProject();
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'client-A', vectorClock: { 'client-A': 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'collide.md',
+        payload: { fileType: 'TEXT', contentHash: 'h1', size: 1 },
+        data: Buffer.from('a'),
+      },
+    );
+    const conflictCreate = (text: string, hash: string, n: number) =>
+      applyOperation(
+        { projectId, authorId: ownerId, clientId: 'client-B', vectorClock: { 'client-B': n } },
+        {
+          opType: 'CREATE',
+          filePath: 'collide.md',
+          payload: { fileType: 'TEXT', contentHash: hash, size: text.length },
+          data: Buffer.from(text),
+        },
+      );
+
+    const first = await conflictCreate('mine v1\n', 'h2', 1);
+    if (first.outcome.kind !== 'conflict_create_renamed') throw new Error('expected conflict');
+    const copyId = first.outcome.fileId;
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, await storedState(copyId));
+    expect(peer.getText(TEXT_KEY).toString()).toBe('mine v1\n');
+
+    // Same content again: the stored history is left exactly as it was.
+    const firstState = Buffer.from(await storedState(copyId));
+    await conflictCreate('mine v1\n', 'h2', 2);
+    expect(Buffer.from(await storedState(copyId)).equals(firstState)).toBe(true);
+
+    // New content: the peer holding the first history ends up with it alone.
+    const retry = await conflictCreate('mine v2\n', 'h3', 3);
+    expect(retry.outcome).toMatchObject({ kind: 'conflict_create_renamed', fileId: copyId });
+    expect(retry.log.payload).not.toHaveProperty('revived');
+    Y.applyUpdate(peer, await storedState(copyId));
+    expect(peer.getText(TEXT_KEY).toString()).toBe('mine v2\n');
+  });
+
+  it('a first CREATE is not marked revived', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const created = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'fresh.md',
+        payload: { fileType: 'TEXT', contentHash: 'h', size: NEW.length },
+        data: Buffer.from(NEW),
+      },
+    );
+    expect(created.log.payload).not.toHaveProperty('revived');
+    if (created.outcome.kind !== 'created') throw new Error('expected created');
+    expect(textOf(await storedState(created.outcome.fileId))).toBe(NEW);
   });
 });
 

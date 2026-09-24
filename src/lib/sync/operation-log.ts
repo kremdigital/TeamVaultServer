@@ -2,7 +2,7 @@ import { Prisma, type FileType, type OpType, type OperationLog } from '@prisma/c
 import { prisma } from '@/lib/db/client';
 import { deleteProjectFile, moveProjectFile, writeProjectFile } from '@/lib/files/storage';
 import { InvalidPathError, normalizeVaultPath } from '@/lib/files/paths';
-import { buildInitialState } from '@/lib/crdt/persistence';
+import { writeYjsText } from '@/lib/crdt/persistence';
 import { merge, type VectorClock } from './vector-clock';
 
 // ---------------------------------------------------------------------------
@@ -182,8 +182,26 @@ async function applyCreate(
   // idempotently refresh the conflict copy's content if it was already live.
   const atPath = await prisma.vaultFile.findUnique({
     where: { projectId_path: { projectId: ctx.projectId, path: pathToUse } },
-    select: { id: true },
+    select: { id: true, deletedAt: true },
   });
+  const revived = atPath !== null && atPath.deletedAt !== null;
+
+  // For TEXT files the Y.Doc carries the content. Without it, project:join's
+  // `yjsDocs` payload on a fresh client is empty, and the engine has no way to
+  // materialize the file on disk — the operation log knows the file exists
+  // but never sees the bytes.
+  //
+  // A row that already exists (tombstone or live conflict copy) keeps its id,
+  // so its Y.Doc keeps its HISTORY: the new text goes on top of the stored one
+  // (delete all + insert), exactly like a REST UPDATE. Replacing it with
+  // `buildInitialState` gave the same fileId an independent history, and every
+  // device still holding the old one (offline while the note was deleted and
+  // re-created — "Untitled", a template, restore from trash — or a retried
+  // conflict CREATE) merged both texts and pushed the duplicate to the whole
+  // team. Written before the row is revived, so a `yjs:update` for the fileId
+  // can't be accepted against the old state in between.
+  const text = op.payload.fileType === 'TEXT' ? op.data.toString('utf8') : null;
+  if (atPath && text !== null) await writeYjsText(atPath.id, text);
 
   const file = atPath
     ? await prisma.vaultFile.update({
@@ -211,26 +229,8 @@ async function applyCreate(
         select: { id: true, path: true },
       });
 
-  // For TEXT files, seed a Yjs document with the initial content. Without
-  // this, project:join's `yjsDocs` payload on a fresh client is empty,
-  // and the engine has no way to materialize the file on disk — the
-  // operation log knows the file exists but never sees the bytes.
-  if (op.payload.fileType === 'TEXT') {
-    const text = op.data.toString('utf8');
-    const { state, stateVector } = buildInitialState(text);
-    await prisma.yjsDocument.upsert({
-      where: { fileId: file.id },
-      create: {
-        fileId: file.id,
-        state: Buffer.from(state),
-        stateVector: Buffer.from(stateVector),
-      },
-      update: {
-        state: Buffer.from(state),
-        stateVector: Buffer.from(stateVector),
-      },
-    });
-  }
+  // A brand-new row has no stored doc: this seeds a fresh one.
+  if (!atPath && text !== null) await writeYjsText(file.id, text);
 
   const log = await writeLog(ctx, {
     opType: 'CREATE',
@@ -239,6 +239,10 @@ async function applyCreate(
       ...op.payload,
       fileId: file.id,
       originalPath: normalizedPath,
+      // The id is an old one brought back from a tombstone, with its Y.Doc
+      // history extended (see docs/sync-protocol.md). Servers that replaced the
+      // history never wrote this marker.
+      ...(revived ? { revived: true } : {}),
     } as Prisma.InputJsonValue,
   });
 

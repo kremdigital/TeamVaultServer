@@ -216,6 +216,35 @@ describe('REST-записи видны клиентам синхронизаци
     expect(await yjsText(row!.id)).toBe('второе\n');
   });
 
+  it('оживление через REST продолжает историю: клиент со старой историей получает ровно новый текст', async () => {
+    // MCP write_note или веб создаёт заметку на месте удалённой: сервер оживляет
+    // тот же fileId. Устройство, которое было офлайн, держит старую историю этой
+    // заметки. Подмена документа свежим (buildInitialState) давала ему «старое
+    // плюс новое», и задвоение уходило всей команде.
+    const { projectId, plain } = await seedOwnerWithKey();
+    const created = await post(plain, projectId, 'Untitled.md', 'старый текст\n');
+    const { file } = (await created.json()) as { file: { id: string } };
+
+    const device = new Y.Doc();
+    const seeded = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId: file.id } });
+    Y.applyUpdate(device, new Uint8Array(seeded.state));
+
+    await deleteFile(
+      new Request('http://localhost/api/projects/x/files/y', {
+        method: 'DELETE',
+        headers: { [API_KEY_HEADER]: plain },
+      }),
+      { params: Promise.resolve({ id: projectId, fileId: file.id }) },
+    );
+    const again = await post(plain, projectId, 'Untitled.md', 'новая заметка\n');
+    expect(again.status).toBe(201);
+    expect(((await again.json()) as { file: { id: string } }).file.id).toBe(file.id);
+
+    const after = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId: file.id } });
+    Y.applyUpdate(device, new Uint8Array(after.state));
+    expect(device.getText(TEXT_KEY).toString()).toBe('новая заметка\n');
+  });
+
   it('живой файл на пути по-прежнему даёт 409', async () => {
     const { projectId, plain } = await seedOwnerWithKey();
     await post(plain, projectId, 'занято.md', 'первое\n');

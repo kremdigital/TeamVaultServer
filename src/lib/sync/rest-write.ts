@@ -15,10 +15,9 @@
  * Здесь всё это собрано в одном месте: `applyOperation` (журнал + диск + Yjs
  * для CREATE) и публикация в канал сокет-процесса.
  */
-import * as Y from 'yjs';
 import { Prisma, type FileType } from '@prisma/client';
 import { prisma } from '@/lib/db/client';
-import { loadYjsDoc, TEXT_KEY } from '@/lib/crdt/persistence';
+import { writeYjsText } from '@/lib/crdt/persistence';
 import { applyOperation, type ApplyResult, type OperationInput } from './operation-log';
 import { increment, parseClock, type VectorClock } from './vector-clock';
 import { publishOperation, type OperationNotification } from '@/lib/realtime/bridge';
@@ -150,24 +149,11 @@ export async function applyRestOperation(opts: RestWriteOpts): Promise<ApplyResu
   // воспроизвёлся при живом тесте MCP.
   //
   // При мутации в состояние попадает и УДАЛЕНИЕ прежнего текста, поэтому
-  // клиент, применив новое состояние, сходится к нужному содержимому.
+  // клиент, применив новое состояние, сходится к нужному содержимому. Тем же
+  // `writeYjsText` пользуется CREATE на существующей строке (оживление
+  // тумбстоуна, повтор конфликтной копии) — см. `applyCreate`.
   if (opts.op.opType === 'UPDATE' && opts.fileType === 'TEXT' && opts.textContent !== undefined) {
-    const fileId = opts.op.payload.fileId;
-    const doc = await loadYjsDoc(fileId);
-    const text = doc.getText(TEXT_KEY);
-    if (text.toString() !== opts.textContent) {
-      doc.transact(() => {
-        text.delete(0, text.length);
-        text.insert(0, opts.textContent as string);
-      });
-    }
-    const state = Buffer.from(Y.encodeStateAsUpdate(doc));
-    const stateVector = Buffer.from(Y.encodeStateVector(doc));
-    await prisma.yjsDocument.upsert({
-      where: { fileId },
-      create: { fileId, state, stateVector },
-      update: { state, stateVector },
-    });
+    await writeYjsText(opts.op.payload.fileId, opts.textContent);
   }
 
   // fileId берём из outcome: при CREATE он выдаётся сервером, при остальных
