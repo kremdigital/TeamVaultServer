@@ -74,6 +74,33 @@ describe('normalizeVaultPath', () => {
     );
   });
 
+  it('rejects names Windows resolves to another file, on incoming paths', () => {
+    for (const path of [
+      '.obsidian::$INDEX_ALLOCATION/plugins/team-vault/data.json',
+      'desktop.ini::$DATA',
+      'notes/a:b.md',
+      'OBSIDI~1/plugins/team-vault/data.json',
+      'GIT~1/hooks/pre-commit',
+      'docs/DROPBO~1.CAC',
+      'obsidi~1/x.md',
+    ]) {
+      expect(() => normalizeVaultPath(path), path).toThrow(InvalidPathError);
+    }
+  });
+
+  it('keeps names that only look like a Windows short name', () => {
+    // Longer than 8 before the `~`, or `~` not followed by digits only.
+    expect(normalizeVaultPath('Chapter~1.md')).toBe('Chapter~1.md');
+    expect(normalizeVaultPath('notes/draft~final.md')).toBe('notes/draft~final.md');
+    expect(normalizeVaultPath('a~1.markdown')).toBe('a~1.markdown');
+    expect(normalizeVaultPath('~/readme.md')).toBe('~/readme.md');
+  });
+
+  it('still reads a stored row whose name Windows would alias', () => {
+    expect(normalizeVaultPath('notes/a:b.md', { allowClientDirs: true })).toBe('notes/a:b.md');
+    expect(normalizeVaultPath('DRAFT~1.md', { allowClientDirs: true })).toBe('DRAFT~1.md');
+  });
+
   it('rejects empty input', () => {
     expect(() => normalizeVaultPath('')).toThrow(InvalidPathError);
     expect(() => normalizeVaultPath('/')).toThrow(InvalidPathError);

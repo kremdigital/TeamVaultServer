@@ -9,6 +9,30 @@
 
 ### Security
 
+- **Имена, которые Windows открывает как другой файл, запрещены во входящих
+  путях.** `normalizeVaultPath` отклоняет сегмент с `:` (на NTFS
+  `.obsidian::$INDEX_ALLOCATION` — это папка конфигурации, `name:stream` —
+  поток файла `name`; Obsidian запрещает `:` на всех платформах) и сегмент вида
+  короткого имени 8.3 (`OBSIDI~1`, `GIT~1`, `DROPBO~1.CAC`): такой путь на
+  клиенте Windows открывал бы настройки плагина с API-ключом или хуки git в
+  обход запрета клиентских папок. Правило то же, что в гейте путей плагина
+  0.3.8. Как и запрет клиентских папок, действует только на входящих путях:
+  строки, сохранённые раньше, остаются читаемыми и удаляемыми.
+- **socket.io-parser 4.2.7 (GHSA-2m8v-j782-fhvr, high).** Сокет-процесс (:3001)
+  использовал `socket.io-parser` 4.2.6, который неверно обрабатывает бинарные
+  пакеты с недопустимым числом вложений. `socket.io` 4.8.3 (последняя версия)
+  всё ещё допускает 4.2.6, поэтому исправленный парсер закреплён через
+  `pnpm.overrides` (`socket.io-parser@<4.2.7` → `^4.2.7`), как в плагине.
+- **Next.js 16.3.6** (было 16.2.7), eslint-config-next 16.3.6: закрыты две
+  critical RCE (GHSA-p293-qw3h-jr36, GHSA-2xp9-vwfh-vxw4), обход proxy при
+  Turbopack и одной локали (GHSA-6gpp-xcg3-4w24), SSRF и DoS в Server Actions.
+- **nodemailer 9.1.1** (было 8.0.7): GHSA-p6gq-j5cr-w38f, GHSA-2x7j-588g-ccc2.
+  **js-yaml 4.3.2**: бюджет merge-ключей, а frontmatter заметок пишет любой
+  участник проекта.
+- overrides транзитивных зависимостей: hono, fast-uri, ip-address, postcss,
+  browserslist, brace-expansion, mysql2, deepmerge-ts 8. `pnpm audit --prod` без
+  high и critical (было 32 high и 2 critical).
+
 - **Клиентские папки запрещены в путях файлов.** `normalizeVaultPath`
   отклоняет сегменты `.obsidian`, `.trash` и `.git` (к прежним `.versions` и
   `.staging`), сравнивая имена без учёта регистра. Это вторая половина гейта
@@ -27,6 +51,21 @@
   и блокировать очередь. Тем же машинным кодом отвечает и `path_is_directory`
   (папка на месте файла) — повтор его тоже не исправит.
 
+### Changed
+
+- `next.config.ts`: `agentRules: false`. С Next.js 16.3 `next dev`, обнаружив
+  ИИ-агента, пишет AGENTS.md и CLAUDE.md в корень репозитория; эта настройка
+  это отключает.
+- Дашборд: после создания проекта переход на его страницу идёт через
+  клиентский роутер (`router.push`), а не полной перезагрузкой
+  (`window.location.assign`).
+- **README, ручная установка:** Caddyfile рендерится тем же `envsubst`, что и в
+  `install.sh`. Прежний `sed 's/{$DOMAIN}/…/'` не совпадал с плейсхолдером
+  `${DOMAIN}` и ничего не подставлял. **README, обновление:** как
+  перегенерировать `/etc/caddy/Caddyfile` после изменения шаблона
+  (`EXTRA_DOMAINS` из `MIRROR_DOMAINS`, сверка адреса сайта, бэкап со свежим
+  mtime, чтобы таймер очистки не удалил его раньше 30 суток).
+
 ### Added
 
 - **Контекстное меню в веб-браузере заметок.** Правый клик на файле или папке
@@ -42,12 +81,15 @@
 ### Security
 
 - **Заголовки безопасности** на уровне Caddy (значит, и для сокет-эндпоинтов):
-  `Strict-Transport-Security` (30 дней, **без** `preload` — он необратим на
-  месяцы), `X-Content-Type-Options`, `X-Frame-Options: DENY` вместе с
+  `Strict-Transport-Security` на год (`max-age=31536000`, было 30 дней) с
+  `includeSubDomains` и **без** `preload` — он необратим на месяцы,
+  `X-Content-Type-Options`, `X-Frame-Options: DENY` вместе с
   `Content-Security-Policy: frame-ancestors 'none'`, `Referrer-Policy`,
-  `Permissions-Policy`. Полноценный CSP требует nonce для inline-скриптов
-  Next.js — это отдельная работа, здесь только запрет фрейминга.
-  `poweredByHeader: false` — версия фреймворка наружу больше не уходит.
+  `Permissions-Policy`. Полноценный CSP со `script-src` рассмотрен и отклонён:
+  Next.js 16 отдаёт RSC-payload inline-скриптами, которые принимают nonce, но
+  не хеш, так что строгой политике нужен nonce на каждый запрос, а он делает
+  все страницы динамическими. `poweredByHeader: false` — версия фреймворка
+  наружу больше не уходит.
 
 ### Fixed
 

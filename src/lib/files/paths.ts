@@ -30,6 +30,30 @@ const RESERVED_STORAGE_NAMES = new Set(['.versions', '.staging']);
  */
 const RESERVED_CLIENT_NAMES = new Set(['.obsidian', '.trash', '.git']);
 
+/**
+ * An 8.3 short name: up to 8 characters ending in `~<digits>`, then
+ * optionally a dot and up to 3 more (`OBSIDI~1`, `GIT~1`, `DROPBO~1.CAC`).
+ * Group 1 is the part before the extension. Same rule as the plugin's path
+ * gate (`src/watcher/path-utils.ts` in TeamVaultPlugin).
+ */
+const SHORT_NAME_PATTERN = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
+
+/**
+ * True for a name that Windows opens as a different file or folder than the
+ * one it spells, so no name comparison can vouch for it: any `:` (on NTFS
+ * `.obsidian::$INDEX_ALLOCATION` IS the config folder, `name:stream` a stream
+ * of `name`; Obsidian forbids `:` on every platform) and any 8.3 short name
+ * (`OBSIDI~1/plugins/team-vault/data.json` opens a Windows client's plugin
+ * settings, API key included). The server itself runs on Linux, where these
+ * names are harmless — it refuses them because it hands paths to Windows
+ * clients.
+ */
+export function isWindowsAlias(segment: string): boolean {
+  if (segment.includes(':')) return true;
+  const shortName = SHORT_NAME_PATTERN.exec(segment);
+  return shortName !== null && (shortName[1] ?? '').length <= 8;
+}
+
 /** A content hash must be a bare 64-char lowercase hex string — used as a
  *  filename in the staging area, so it must never contain path separators. */
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -50,6 +74,8 @@ export interface NormalizeOptions {
  * - rejects absolute paths, NUL bytes, names with `..`
  * - converts Windows separators to forward slashes
  * - rejects empty segments and reserved folder names
+ * - for incoming paths, rejects names Windows resolves to another file
+ *   (`isWindowsAlias`)
  */
 export function normalizeVaultPath(input: string, opts: NormalizeOptions = {}): string {
   if (input.includes('\0')) {
@@ -75,6 +101,11 @@ export function normalizeVaultPath(input: string, opts: NormalizeOptions = {}): 
     }
     if (!opts.allowClientDirs && RESERVED_CLIENT_NAMES.has(lower)) {
       throw new InvalidPathError(`Reserved folder name: ${segment}`);
+    }
+    // Only for paths a client creates or moves to: a row stored before this
+    // rule must stay readable and removable, like the client folders above.
+    if (!opts.allowClientDirs && isWindowsAlias(segment)) {
+      throw new InvalidPathError(`Name Windows resolves to another file: ${segment}`);
     }
     if (segment.length > 255) throw new InvalidPathError('Path segment too long');
   }
