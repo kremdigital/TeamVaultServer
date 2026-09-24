@@ -21,17 +21,31 @@ ${DOMAIN}${EXTRA_DOMAINS} {
     # process and the socket one). Set at the edge rather than in
     # `next.config.ts` so the socket endpoints are covered too.
     #
-    # HSTS deliberately has NO `preload` and a modest 30-day max-age: preload
-    # is effectively irreversible for months, and this list is easy to raise
-    # once it has proven itself. Caddy already 308s plain HTTP to HTTPS; HSTS
-    # closes the first-request window.
+    # HSTS: one year, deliberately WITHOUT `preload`. It started at 30 days and
+    # was raised once HTTPS (with Let's Encrypt renewals) had proven stable on
+    # every hostname of this block. Preload is effectively irreversible for
+    # months and needs a separate decision. Caddy already 308s plain HTTP to
+    # HTTPS; HSTS makes browsers skip that plain-HTTP hop on later visits.
+    # Browsers re-read max-age on every HTTPS response, so lowering it again
+    # takes effect on a user's next visit. A mirror added to this site block
+    # gets the same header: it must serve HTTPS from day one (Caddy does).
     #
     # Framing is denied twice on purpose: `frame-ancestors` is the modern rule,
-    # `X-Frame-Options` covers clients that ignore it. The CSP intentionally
-    # carries *only* `frame-ancestors` — a full policy needs per-request nonces
-    # for Next.js inline scripts, which is a separate piece of work.
+    # `X-Frame-Options` covers clients that ignore it. Nothing legitimate
+    # frames these pages: the app never embeds itself (note embeds `![[…]]`
+    # render inline, not in an iframe), there are no public note pages, and
+    # neither the Obsidian plugin nor the MCP server loads them in a frame.
+    # With `SameSite=Lax` session cookies a cross-site frame would be logged
+    # out anyway, so no embedding could have been relied on.
+    #
+    # The CSP intentionally carries *only* `frame-ancestors`. A script policy
+    # for Next.js 16 needs a per-request nonce, which forces every page into
+    # dynamic rendering (the prerendered /login, /register, /forgot-password
+    # included), and inline <style> from sonner, CodeMirror and React style
+    # attributes would still need `style-src 'unsafe-inline'`. That trade was
+    # declined; notes are rendered without raw HTML (`skipHtml`).
     header {
-        Strict-Transport-Security "max-age=2592000; includeSubDomains"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
         Content-Security-Policy "frame-ancestors 'none'"
