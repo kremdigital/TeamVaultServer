@@ -19,7 +19,7 @@ import { Prisma, type FileType } from '@prisma/client';
 import { prisma } from '@/lib/db/client';
 import { writeYjsText } from '@/lib/crdt/persistence';
 import { applyOperation, type ApplyResult, type OperationInput } from './operation-log';
-import { increment, parseClock, type VectorClock } from './vector-clock';
+import { getCount, increment, parseClock, type VectorClock } from './vector-clock';
 import { publishOperation, type OperationNotification } from '@/lib/realtime/bridge';
 
 /**
@@ -35,22 +35,42 @@ export function restClientId(userId: string): string {
 }
 
 /**
- * Следующий vector clock для псевдоклиента: берём последний известный по
- * проекту и инкрементируем свою координату.
+ * Следующий vector clock для псевдоклиента: последний clock журнала проекта,
+ * а своя координата — на единицу больше самого большого своего счётчика в
+ * журнале.
  *
- * Точность здесь не критична — счётчик нужен, чтобы операция не выглядела
- * «уже виденной» относительно `sinceVectorClock` клиента. Гонка двух
- * параллельных REST-запросов может выдать одинаковый счётчик; это лишь
- * означает, что клиент получит обе операции (журнал упорядочен по `createdAt`),
- * а не потеряет их.
+ * Счётчик нужен, чтобы операция не выглядела «уже виденной» относительно
+ * `sinceVectorClock` клиента, поэтому он обязан расти. Раньше своя координата
+ * бралась из последней операции журнала. Если это была операция плагина, чей
+ * clock не видел прежних REST-записей (живые трансляции его clock не двигают),
+ * счётчик начинался заново и повторял уже выданный. Устройство, которое
+ * догнало прежнюю запись с тем же счётчиком, считало новую виденной и не
+ * получало её в catch-up.
+ *
+ * Гонка двух параллельных REST-запросов одного пользователя по-прежнему может
+ * выдать одинаковый счётчик: оба запроса читают журнал до записи.
  */
 export async function nextVectorClock(projectId: string, clientId: string): Promise<VectorClock> {
-  const last = await prisma.operationLog.findFirst({
-    where: { projectId },
-    orderBy: { createdAt: 'desc' },
-    select: { vectorClock: true },
-  });
-  return increment(parseClock(last?.vectorClock), clientId);
+  const [last, [own]] = await Promise.all([
+    prisma.operationLog.findFirst({
+      where: { projectId },
+      orderBy: { createdAt: 'desc' },
+      select: { vectorClock: true },
+    }),
+    // Весь журнал проекта, а не только записи этого пользователя: копия
+    // счётчика в чужом clock переживает удаление самой записи (purge-tombstones).
+    prisma.$queryRaw<Array<{ counter: number | null }>>(Prisma.sql`
+      SELECT max(
+        CASE WHEN jsonb_typeof(o."vectorClock" -> ${clientId}) = 'number'
+             THEN (o."vectorClock" -> ${clientId})::float8 END
+      ) AS "counter"
+      FROM "OperationLog" o
+      WHERE o."projectId" = ${projectId}
+    `),
+  ]);
+  const clock = parseClock(last?.vectorClock);
+  const highest = Math.max(getCount(clock, clientId), own?.counter ?? 0);
+  return increment({ ...clock, [clientId]: highest }, clientId);
 }
 
 /** Какое Socket.IO-событие соответствует операции. */

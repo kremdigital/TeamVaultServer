@@ -7,13 +7,33 @@
  * операции в catch-up не попадали вообще: клиент не узнавал ни о новых
  * вложениях, ни об удалениях и переименованиях, сделанных, пока он был офлайн.
  */
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Prisma } from '@prisma/client';
-import { CATCHUP_OPERATIONS_LIMIT, listOperationsSince } from '@/lib/sync/operation-log';
+import {
+  applyOperation,
+  CATCHUP_OPERATIONS_LIMIT,
+  listOperationsSince,
+} from '@/lib/sync/operation-log';
+import { applyRestOperation, restClientId } from '@/lib/sync/rest-write';
 import type { VectorClock } from '@/lib/sync/vector-clock';
 import { resetDatabase, testPrisma } from '../db';
 
+let storageRoot: string;
+let originalStoragePath: string | undefined;
+
+beforeAll(async () => {
+  storageRoot = await mkdtemp(join(tmpdir(), 'osync-catchup-'));
+  originalStoragePath = process.env.STORAGE_PATH;
+  process.env.STORAGE_PATH = storageRoot;
+});
+
 afterAll(async () => {
+  if (originalStoragePath !== undefined) process.env.STORAGE_PATH = originalStoragePath;
+  else delete process.env.STORAGE_PATH;
+  await rm(storageRoot, { recursive: true, force: true });
   await testPrisma.$disconnect();
 });
 
@@ -21,7 +41,7 @@ beforeEach(async () => {
   await resetDatabase();
 });
 
-async function seedProject(): Promise<string> {
+async function seedOwnedProject(): Promise<{ projectId: string; ownerId: string }> {
   const owner = await testPrisma.user.create({
     data: { email: `c-${Date.now()}-${Math.random()}@x.test`, passwordHash: 'h', name: 'C' },
   });
@@ -33,7 +53,11 @@ async function seedProject(): Promise<string> {
       members: { create: { userId: owner.id, role: 'ADMIN', addedById: owner.id } },
     },
   });
-  return project.id;
+  return { projectId: project.id, ownerId: owner.id };
+}
+
+async function seedProject(): Promise<string> {
+  return (await seedOwnedProject()).projectId;
 }
 
 const BASE = Date.UTC(2026, 8, 1);
@@ -202,5 +226,57 @@ describe('listOperationsSince: the limit', () => {
     const behind = await listOperationsSince({ projectId, since: { A: 2 } });
     expect(behind.truncated).toBe(false);
     expect(behind.operations).toHaveLength(CATCHUP_OPERATIONS_LIMIT);
+  });
+});
+
+describe('REST writes in the catch-up', () => {
+  /** A text file written the way `POST /files` (and MCP `write_note`) does. */
+  function restCreate(projectId: string, userId: string, path: string) {
+    return applyRestOperation({
+      projectId,
+      userId,
+      op: {
+        opType: 'CREATE',
+        filePath: path,
+        payload: { fileType: 'TEXT', contentHash: `h-${path}`, size: 1 },
+        data: Buffer.from(path),
+      },
+    });
+  }
+
+  it('a REST write never reuses a counter, so a client that saw the old one still gets it', async () => {
+    const { projectId, ownerId } = await seedOwnedProject();
+    const rest = restClientId(ownerId);
+
+    // MCP writes a note: `rest:<user>` 1.
+    await restCreate(projectId, ownerId, 'mcp-1.md');
+    // A plugin that received it live (live events don't move its clock)
+    // creates an attachment: its clock has no `rest:<user>`.
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.bin',
+        payload: { fileType: 'BINARY', contentHash: 'h-a', size: 1 },
+        data: Buffer.from('a'),
+      },
+    );
+    // Another device catches up on both and stops there.
+    const seen = await listOperationsSince({ projectId, since: {} });
+    const since: VectorClock = {};
+    for (const op of seen.operations) {
+      for (const [client, counter] of Object.entries(op.vectorClock as VectorClock)) {
+        since[client] = Math.max(since[client] ?? 0, counter);
+      }
+    }
+    expect(since).toEqual({ [rest]: 1, A: 1 });
+
+    // MCP writes again. Built on the plugin's clock, this one got
+    // `rest:<user>` 1 again, and the device took it for seen.
+    const second = await restCreate(projectId, ownerId, 'mcp-2.md');
+
+    expect((second.log.vectorClock as VectorClock)[rest]).toBe(2);
+    const { operations } = await listOperationsSince({ projectId, since });
+    expect(paths(operations)).toEqual(['mcp-2.md']);
   });
 });
