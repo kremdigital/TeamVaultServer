@@ -56,6 +56,12 @@ export interface JoinAckPayload {
     createdAt: Date;
   }>;
   /**
+   * Present (always `true`) when the client had more unseen operations than
+   * one catch-up returns: `operations` holds the newest of them, the older ones
+   * are left out. Older clients ignore it.
+   */
+  operationsTruncated?: true;
+  /**
    * Legacy inline catch-up: full Y.Doc state of every text file. Present ONLY
    * for clients that did not request streaming. Building this loads every doc
    * into memory and the client applies them synchronously — both scale badly,
@@ -119,10 +125,18 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
     await socket.join(projectRoom(payload.projectId));
 
     // 1) Operation log catch-up.
-    const ops = await listOperationsSince({
+    const { operations: ops, truncated } = await listOperationsSince({
       projectId: payload.projectId,
       since: payload.sinceVectorClock ?? {},
     });
+    if (truncated) {
+      log.warn(
+        { projectId: payload.projectId, ops: ops.length },
+        'project:join: catch-up truncated to the newest operations',
+      );
+    }
+    // Additive: set only when older unseen operations were left out.
+    const truncation = truncated ? { operationsTruncated: true as const } : {};
     const operations = ops.map((o) => ({
       id: o.id,
       opType: o.opType,
@@ -138,7 +152,7 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
     // edits via `yjs:fetch`). Still joined the room above for live broadcasts.
     if (payload.skipYjsCatchup) {
       log.info({ projectId: payload.projectId, ops: ops.length, yjsSkipped: true }, 'project:join');
-      cb({ ok: true, operations, yjsSkipped: true });
+      cb({ ok: true, operations, ...truncation, yjsSkipped: true });
       return;
     }
 
@@ -154,7 +168,7 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
         { projectId: payload.projectId, ops: ops.length, docs: textFiles.length, stream: true },
         'project:join',
       );
-      cb({ ok: true, operations, yjsStream: true, yjsCount: textFiles.length });
+      cb({ ok: true, operations, ...truncation, yjsStream: true, yjsCount: textFiles.length });
       await streamYjsCatchup(socket, payload.projectId, textFiles, log);
       return;
     }
@@ -165,7 +179,7 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
       { projectId: payload.projectId, ops: ops.length, docs: yjsDocs.length },
       'project:join',
     );
-    cb({ ok: true, operations, yjsDocs });
+    cb({ ok: true, operations, ...truncation, yjsDocs });
   });
 
   socket.on('project:leave', async (raw: unknown, cb?: (ack: { ok: true }) => void) => {

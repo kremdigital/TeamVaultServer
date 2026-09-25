@@ -830,11 +830,11 @@ describe('listOperationsSince', () => {
 
     // From the perspective of a client that has already seen A:1 — they should still
     // pick up the second op (A:2).
-    const ops = await listOperationsSince({ projectId, since: { A: 1 } });
+    const { operations: ops } = await listOperationsSince({ projectId, since: { A: 1 } });
     expect(ops.map((o) => o.filePath)).toEqual(['b.md']);
 
     // From a fresh perspective, they should pick up everything.
-    const all = await listOperationsSince({ projectId, since: {} });
+    const { operations: all } = await listOperationsSince({ projectId, since: {} });
     expect(all.map((o) => o.filePath)).toEqual(['a.md', 'b.md']);
   });
 });

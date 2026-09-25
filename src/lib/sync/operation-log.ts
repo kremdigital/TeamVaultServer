@@ -89,32 +89,83 @@ export async function applyOperation(ctx: ApplyContext, op: OperationInput): Pro
 }
 
 /**
- * List operations for a project that happened *after* `sinceVectorClock`,
- * i.e. whose own clock is not happens-before-or-equal `sinceVectorClock`.
+ * Most operations one `project:join` catch-up returns (see
+ * {@link listOperationsSince} and `docs/sync-protocol.md`, «Подключение»).
  *
- * Note: the strictly-correct filter would compare each clock pairwise, but a cheap
- * upper bound is to compare per-client counters: an operation must include changes
- * from at least one client whose counter exceeds the value in `since`. We do the
- * filtering on the application side after fetching by `createdAt`.
+ * A reconnect after a day offline misses tens to hundreds of operations; a
+ * fresh client gets the whole journal, 609 rows in the largest project today.
+ * It needs it: an attachment reaches a fresh client only through the CREATE
+ * of it, the listing and the Yjs catch-up don't carry its bytes. 5000 keeps
+ * every such catch-up whole with room to grow, while the ack stays within a
+ * few megabytes (700–800 bytes per row as JSON) and the client's replay, one
+ * awaited step per row, stays short.
+ */
+export const CATCHUP_OPERATIONS_LIMIT = 5000;
+
+export interface OperationsSince {
+  /** Operations the client has not seen, oldest first. */
+  operations: OperationLog[];
+  /**
+   * More were unseen than the limit: `operations` holds the NEWEST of them,
+   * and the older ones are left out.
+   */
+  truncated: boolean;
+}
+
+/**
+ * The operations of a project the client has not seen: those whose clock is
+ * not covered by `since`, i.e. has a counter above `since` for at least one
+ * client. Oldest first, by `createdAt` and then `id`.
+ *
+ * The filter runs in PostgreSQL, over the whole journal of the project, walked
+ * newest first along `(projectId, createdAt)`: about 4 µs a row, 0.2 s for a
+ * caught-up client of a 50 000-row journal; a fresh one stops at the limit. It
+ * used to run here, over the 500 OLDEST rows of the project, so in a project
+ * with a longer journal no new operation ever came back.
+ *
+ * With more unseen operations than `limit` (default
+ * {@link CATCHUP_OPERATIONS_LIMIT}) the newest `limit` of them come back and
+ * `truncated` is set. The newest, not the oldest: a client checks each replayed
+ * operation against the files as they are now (the listing), and a tail of the
+ * history ends where they are now, while a head of it moved files back to
+ * names they had long left.
  */
 export async function listOperationsSince(opts: {
   projectId: string;
   since: VectorClock;
   limit?: number;
-}): Promise<OperationLog[]> {
-  const rows = await prisma.operationLog.findMany({
-    where: { projectId: opts.projectId },
-    orderBy: { createdAt: 'asc' },
-    take: opts.limit ?? 500,
-  });
-
-  return rows.filter((row) => {
-    const opClock = row.vectorClock as Record<string, number>;
-    for (const [client, counter] of Object.entries(opClock)) {
-      if ((opts.since[client] ?? 0) < counter) return true;
-    }
-    return false;
-  });
+}): Promise<OperationsSince> {
+  const limit = opts.limit ?? CATCHUP_OPERATIONS_LIMIT;
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('invalid_limit');
+  // The newest `limit + 1` unseen rows: the extra one says whether any were
+  // left out. A clock that is not an object, or a counter that is not a number
+  // (the server never writes either), counts as seen rather than failing the
+  // query: the CASEs keep the casts off such values, since PostgreSQL doesn't
+  // promise to evaluate an AND left to right.
+  const rows = await prisma.$queryRaw<OperationLog[]>(Prisma.sql`
+    SELECT w.* FROM (
+      SELECT o."id", o."projectId", o."opType", o."filePath", o."newPath", o."authorId",
+             o."vectorClock", o."payload", o."createdAt"
+      FROM "OperationLog" o
+      WHERE o."projectId" = ${opts.projectId}
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_each(
+            CASE WHEN jsonb_typeof(o."vectorClock") = 'object'
+                 THEN o."vectorClock" ELSE '{}'::jsonb END
+          ) AS c(client, counter)
+          WHERE CASE WHEN jsonb_typeof(c.counter) = 'number'
+                     THEN c.counter::numeric
+                          > COALESCE((${JSON.stringify(opts.since)}::jsonb ->> c.client)::numeric, 0)
+                     ELSE false END
+        )
+      ORDER BY o."createdAt" DESC, o."id" DESC
+      LIMIT ${limit + 1}::int
+    ) w
+    ORDER BY w."createdAt" ASC, w."id" ASC
+  `);
+  const truncated = rows.length > limit;
+  return { operations: truncated ? rows.slice(1) : rows, truncated };
 }
 
 /**

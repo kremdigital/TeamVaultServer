@@ -8,7 +8,7 @@ import { Server as IOServer, type ServerOptions } from 'socket.io';
 import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
 import { createIoServer } from '@/socket/server';
 import { relay } from '@/socket/rest-bridge';
-import type { ApplyResult } from '@/lib/sync/operation-log';
+import { CATCHUP_OPERATIONS_LIMIT, type ApplyResult } from '@/lib/sync/operation-log';
 import { applyRestOperation } from '@/lib/sync/rest-write';
 import { generateApiKey } from '@/lib/auth/api-key';
 import { signAccessToken } from '@/lib/auth/jwt';
@@ -251,6 +251,76 @@ describe('project:join', () => {
     const allDocs = batches.flatMap((b) => b.docs);
     expect(allDocs.map((d) => d.fileId)).toContain(file.id);
     expect(batches[batches.length - 1]?.done).toBe(true);
+  });
+
+  describe('on a journal longer than 500 operations', () => {
+    /** `count` operations of client `A`, counters 1..count, oldest first. */
+    async function seedJournal(projectId: string, count: number): Promise<void> {
+      const base = Date.UTC(2026, 8, 1);
+      for (let from = 0; from < count; from += 1000) {
+        const n = Math.min(1000, count - from);
+        await testPrisma.operationLog.createMany({
+          data: Array.from({ length: n }, (_, i) => ({
+            projectId,
+            opType: 'CREATE' as const,
+            filePath: `A-${from + i + 1}.bin`,
+            vectorClock: { A: from + i + 1 },
+            payload: { fileType: 'BINARY', contentHash: 'h', size: 1 },
+            createdAt: new Date(base + (from + i) * 10),
+          })),
+        });
+      }
+    }
+
+    type OpsAck = {
+      ok: true;
+      operations: { filePath: string; vectorClock: Record<string, number> }[];
+      operationsTruncated?: boolean;
+    };
+
+    it('returns the operations the client has not seen, new ones at the end', async () => {
+      const { userId, plainKey } = await bootstrapUserAndKey('long-journal');
+      const project = await createProject(userId);
+      await seedJournal(project.id, 603);
+
+      const c = connect(plainKey);
+      await new Promise<void>((resolve) => c.on('connect', () => resolve()));
+      const ack = await emitWithAck<OpsAck>(c, 'project:join', {
+        projectId: project.id,
+        sinceVectorClock: { A: 600 },
+        streamYjs: true,
+      });
+
+      expect(ack.ok).toBe(true);
+      expect(ack.operations.map((o) => o.filePath)).toEqual([
+        'A-601.bin',
+        'A-602.bin',
+        'A-603.bin',
+      ]);
+      expect(ack.operations[2]?.vectorClock).toEqual({ A: 603 });
+      expect('operationsTruncated' in ack).toBe(false);
+    });
+
+    it('past the limit, sends the newest operations and operationsTruncated', async () => {
+      const { userId, plainKey } = await bootstrapUserAndKey('huge-journal');
+      const project = await createProject(userId);
+      await seedJournal(project.id, CATCHUP_OPERATIONS_LIMIT + 1);
+
+      const c = connect(plainKey);
+      await new Promise<void>((resolve) => c.on('connect', () => resolve()));
+      // Every legacy shape of the join: the flag is on each.
+      for (const extra of [{}, { streamYjs: true }, { skipYjsCatchup: true }]) {
+        const ack = await emitWithAck<OpsAck>(c, 'project:join', {
+          projectId: project.id,
+          sinceVectorClock: {},
+          ...extra,
+        });
+        expect(ack.operationsTruncated).toBe(true);
+        expect(ack.operations).toHaveLength(CATCHUP_OPERATIONS_LIMIT);
+        expect(ack.operations[0]?.filePath).toBe('A-2.bin');
+        expect(ack.operations.at(-1)?.filePath).toBe(`A-${CATCHUP_OPERATIONS_LIMIT + 1}.bin`);
+      }
+    });
   });
 
   it('refuses join for a non-member project', async () => {
