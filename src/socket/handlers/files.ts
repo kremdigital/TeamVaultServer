@@ -1,11 +1,18 @@
 import type { Server, Socket } from 'socket.io';
 import { prisma } from '@/lib/db/client';
 import { canEditFiles, loadProjectAccess } from '@/lib/auth/permissions';
-import { applyOperation, isRevivedCreate, type OperationInput } from '@/lib/sync/operation-log';
+import {
+  applyOperation,
+  isRevivedCreate,
+  isTextUpdate,
+  type OperationInput,
+} from '@/lib/sync/operation-log';
 import { increment, type VectorClock, parseClock } from '@/lib/sync/vector-clock';
 import { child } from '@/lib/logger';
 import { deleteStagedBlob, PathIsDirectoryError, readStagedBlob } from '@/lib/files/storage';
 import { InvalidPathError } from '@/lib/files/paths';
+import { sha256OfBuffer } from '@/lib/files/hash';
+import { recordFileVersion } from '@/lib/files/versioning';
 import { getSocketUser, projectRoom } from '../auth';
 
 interface BaseEnvelope {
@@ -129,18 +136,7 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       // duplicate alongside the seed).
       if (raw.fileType === 'TEXT') {
         const fileId = extractFileId(result.outcome);
-        if (fileId) {
-          const yjsDoc = await prisma.yjsDocument.findUnique({
-            where: { fileId },
-            select: { state: true },
-          });
-          if (yjsDoc?.state && yjsDoc.state.length > 0) {
-            io.to(projectRoom(raw.projectId)).emit('yjs:update', {
-              fileId,
-              update: Array.from(new Uint8Array(yjsDoc.state)),
-            });
-          }
-        }
+        if (fileId) await broadcastYjsState(io, raw.projectId, fileId);
       }
 
       ack({ ok: true, outcome: result.outcome });
@@ -180,12 +176,38 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       if (bytes.staged) {
         await deleteStagedBlob(raw.projectId, raw.contentHash).catch(() => undefined);
       }
-      io.to(projectRoom(raw.projectId)).emit('file:updated-binary', {
-        fileId: raw.fileId,
-        contentHash: raw.contentHash,
-        clientId: raw.clientId,
-        log: serializeLog(result.log),
-      });
+      if (isTextUpdate(result.log)) {
+        // A note (plugin 0.3.x "Keep local" in the content-conflict modal):
+        // `applyOperation` wrote the text into its Y.Doc, the history
+        // extended, like REST PUT. It goes out the way REST PUT's does through
+        // the bridge: the whole doc state as `yjs:update`, to the sender too,
+        // so its doc takes the deletion of the old text before its next fold.
+        // Never `file:updated-binary`: a plugin downloads the bytes of such an
+        // update and settles them by hashes over the CRDT merge, i.e. the
+        // content-conflict modal again, on every device. A no-op (the note is
+        // a tombstone) changed nothing and sends nothing.
+        if (result.outcome.kind === 'updated') {
+          // Like REST PUT: the version history has this text, which a plugin
+          // may look up as the base of its three-way merge (by the hash of
+          // these very bytes). Best effort — the update itself is done, and a
+          // failed ack would only make a 0.3.x queue send it again.
+          await recordFileVersion({
+            projectId: raw.projectId,
+            fileId: result.outcome.fileId,
+            data: bytes.data,
+            contentHash: sha256OfBuffer(bytes.data),
+            authorId: auth.userId,
+          }).catch((err: unknown) => log.warn({ err }, 'file:update-binary: version not recorded'));
+          await broadcastYjsState(io, raw.projectId, result.outcome.fileId);
+        }
+      } else {
+        io.to(projectRoom(raw.projectId)).emit('file:updated-binary', {
+          fileId: raw.fileId,
+          contentHash: raw.contentHash,
+          clientId: raw.clientId,
+          log: serializeLog(result.log),
+        });
+      }
       ack({ ok: true, outcome: result.outcome });
     } catch (err) {
       log.error({ err }, 'file:update-binary failed');
@@ -264,6 +286,26 @@ async function handleMove(
   } catch (err) {
     child({ socket: socket.id }).error({ err }, `${opType.toLowerCase()} failed`);
     ack({ ok: false, error: errorMessage(err) });
+  }
+}
+
+/**
+ * Send a note's whole stored Y.Doc state to the project room as `yjs:update`,
+ * the sender included (the REST bridge does the same for REST writes). A client
+ * holding any part of the doc's history merges it and converges to the stored
+ * text, plus its own edits the server hasn't got yet; a peer that hasn't loaded
+ * the doc materialises the note from it.
+ */
+async function broadcastYjsState(io: Server, projectId: string, fileId: string): Promise<void> {
+  const doc = await prisma.yjsDocument.findUnique({
+    where: { fileId },
+    select: { state: true },
+  });
+  if (doc?.state && doc.state.length > 0) {
+    io.to(projectRoom(projectId)).emit('yjs:update', {
+      fileId,
+      update: Array.from(new Uint8Array(doc.state)),
+    });
   }
 }
 

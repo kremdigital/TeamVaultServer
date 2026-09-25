@@ -4,11 +4,14 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { applyYjsUpdate, TEXT_KEY } from '@/lib/crdt/persistence';
+import type { FileType } from '@prisma/client';
 import {
   appendConflictSuffix,
   applyOperation,
+  isTextUpdate,
   listOperationsSince,
 } from '@/lib/sync/operation-log';
+import { applyRestOperation } from '@/lib/sync/rest-write';
 import { increment } from '@/lib/sync/vector-clock';
 import { resetDatabase, testPrisma } from '../db';
 
@@ -541,6 +544,38 @@ describe('applyOperation: CREATE on a tombstone extends the Y.Doc history', () =
     if (created.outcome.kind !== 'created') throw new Error('expected created');
     expect(textOf(await storedState(created.outcome.fileId))).toBe(NEW);
   });
+
+  it('a doc that cannot be written leaves no bytes behind and the tombstone as it was', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const { fileId } = await noteWithDeviceHistory(projectId, ownerId);
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 1 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+    // A stored state Yjs cannot read.
+    await testPrisma.yjsDocument.update({
+      where: { fileId },
+      data: { state: Buffer.from([1, 2, 3]) },
+    });
+
+    await expect(
+      applyOperation(
+        { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+        {
+          opType: 'CREATE',
+          filePath: 'a.md',
+          payload: { fileType: 'TEXT', contentHash: 'h-new', size: NEW.length },
+          data: Buffer.from(NEW),
+        },
+      ),
+    ).rejects.toThrow();
+    // The doc goes before the bytes: written first, the new text would now sit
+    // on disk under a note whose doc never got it.
+    await expect(readFile(join(storageRoot, projectId, 'a.md'), 'utf8')).rejects.toThrow();
+    const row = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: fileId } });
+    expect(row.deletedAt).not.toBeNull();
+    expect(row.contentHash).toBe('h-old');
+  });
 });
 
 describe('applyOperation: DELETE > UPDATE', () => {
@@ -578,6 +613,123 @@ describe('applyOperation: DELETE > UPDATE', () => {
     expect(reloaded?.deletedAt).not.toBeNull();
     // Hash should NOT have advanced past h1.
     expect(reloaded?.contentHash).toBe('h1');
+  });
+});
+
+describe('applyOperation: UPDATE of a note writes its text into the Y.Doc', () => {
+  // REST PUT (MCP `write_note`) and a plugin's `file:update-binary` of a note
+  // ("Keep local", 0.3.x) both land in `applyUpdate`. The socket path wrote the
+  // bytes and the hash only: the doc kept the old text, and every client and
+  // the next snapshot put it back.
+  const OLD = 'old line\n';
+  const KEPT = 'kept line\n';
+
+  async function docText(fileId: string): Promise<string> {
+    const row = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, new Uint8Array(row.state));
+    const text = doc.getText(TEXT_KEY).toString();
+    doc.destroy();
+    return text;
+  }
+
+  const onDisk = (projectId: string, path: string) =>
+    readFile(join(storageRoot, projectId, path), 'utf8');
+
+  async function create(projectId: string, ownerId: string, path: string, fileType: FileType) {
+    const created = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: path,
+        payload: { fileType, contentHash: 'h-old', size: OLD.length },
+        data: Buffer.from(OLD),
+      },
+    );
+    if (created.outcome.kind !== 'created') throw new Error('expected created');
+    return created.outcome.fileId;
+  }
+
+  const update = (projectId: string, ownerId: string, fileId: string, path: string) =>
+    applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 1 } },
+      {
+        opType: 'UPDATE',
+        filePath: path,
+        payload: { fileId, contentHash: 'h-kept', size: KEPT.length },
+        data: Buffer.from(KEPT),
+      },
+    );
+
+  it('the bytes and the doc agree, and a device holding the old history converges to them', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const fileId = await create(projectId, ownerId, 'a.md', 'TEXT');
+    const device = new Y.Doc();
+    const seeded = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    Y.applyUpdate(device, new Uint8Array(seeded.state));
+
+    const result = await update(projectId, ownerId, fileId, 'a.md');
+    expect(result.outcome).toEqual({ kind: 'updated', fileId });
+    expect(isTextUpdate(result.log)).toBe(true);
+    expect(await onDisk(projectId, 'a.md')).toBe(KEPT);
+    expect(await docText(fileId)).toBe(KEPT);
+
+    // The history is extended, not replaced: the old text's deletion is in it.
+    const stored = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    Y.applyUpdate(device, new Uint8Array(stored.state));
+    expect(device.getText(TEXT_KEY).toString()).toBe(KEPT);
+  });
+
+  it('an attachment gets no Y.Doc', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const fileId = await create(projectId, ownerId, 'img.png', 'BINARY');
+    const result = await update(projectId, ownerId, fileId, 'img.png');
+    expect(result.outcome).toEqual({ kind: 'updated', fileId });
+    expect(isTextUpdate(result.log)).toBe(false);
+    expect(await onDisk(projectId, 'img.png')).toBe(KEPT);
+    expect(await testPrisma.yjsDocument.findUnique({ where: { fileId } })).toBeNull();
+  });
+
+  it('an UPDATE that finds a tombstone leaves the doc of the deleted note alone', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const fileId = await create(projectId, ownerId, 'a.md', 'TEXT');
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 2 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+
+    // A plugin's update, and a REST PUT whose file was deleted right after the
+    // route checked it: REST wrote the doc whatever the outcome.
+    expect((await update(projectId, ownerId, fileId, 'a.md')).outcome.kind).toBe('no_op');
+    const rest = await applyRestOperation({
+      projectId,
+      userId: ownerId,
+      op: {
+        opType: 'UPDATE',
+        filePath: 'a.md',
+        payload: { fileId, contentHash: 'h-rest', size: KEPT.length },
+        data: Buffer.from(KEPT),
+      },
+    });
+    expect(rest.outcome.kind).toBe('no_op');
+    expect(await docText(fileId)).toBe(OLD);
+  });
+
+  it('a doc that cannot be written leaves the bytes, the hash and the journal as they were', async () => {
+    const { projectId, ownerId } = await seedProject();
+    const fileId = await create(projectId, ownerId, 'a.md', 'TEXT');
+    // A stored state Yjs cannot read.
+    await testPrisma.yjsDocument.update({
+      where: { fileId },
+      data: { state: Buffer.from([1, 2, 3]) },
+    });
+
+    await expect(update(projectId, ownerId, fileId, 'a.md')).rejects.toThrow();
+    // Written first, the bytes would now hold a text the doc never got.
+    expect(await onDisk(projectId, 'a.md')).toBe(OLD);
+    const row = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: fileId } });
+    expect(row.contentHash).toBe('h-old');
+    expect(await testPrisma.operationLog.count({ where: { projectId, opType: 'UPDATE' } })).toBe(0);
   });
 });
 

@@ -451,8 +451,6 @@ describe('UPDATEs of text never go out in a catch-up', () => {
     await applyRestOperation({
       projectId,
       userId: ownerId,
-      fileType: 'TEXT',
-      textContent: 'old\nmcp\n',
       op: {
         opType: 'UPDATE',
         filePath: 'a.md',
@@ -474,7 +472,6 @@ describe('UPDATEs of text never go out in a catch-up', () => {
     await applyRestOperation({
       projectId,
       userId: ownerId,
-      fileType: 'BINARY',
       op: {
         opType: 'UPDATE',
         filePath: 'img.png',

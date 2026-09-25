@@ -92,7 +92,7 @@ export async function PUT(request: Request, context: RouteContext): Promise<Next
 
   const file = await prisma.vaultFile.findFirst({
     where: { id: fileId, projectId: id },
-    select: { path: true, deletedAt: true, fileType: true },
+    select: { path: true, deletedAt: true },
   });
   if (!file || file.deletedAt) return errors.notFound('Файл не найден');
 
@@ -102,16 +102,15 @@ export async function PUT(request: Request, context: RouteContext): Promise<Next
     return errors.invalid('file_too_large', `Файл больше ${max} байт`);
   }
 
-  // Через общий механизм: запись на диск, журнал операций, пересборка Yjs для
-  // текста и рассылка клиентам. Прямая запись мимо него оставляла CRDT со
-  // старым текстом — клиент получал устаревшее содержимое и возвращал его назад.
+  // Через общий механизм: запись на диск, журнал операций, текст — в Yjs
+  // (история продолжается, `applyUpdate`) и рассылка клиентам. Прямая запись
+  // мимо него оставляла CRDT со старым текстом — клиент получал устаревшее
+  // содержимое и возвращал его назад.
   const { applyRestOperation } = await import('@/lib/sync/rest-write');
   const contentHash = sha256OfBuffer(buffer);
   await applyRestOperation({
     projectId: id,
     userId: user.id,
-    fileType: file.fileType,
-    ...(file.fileType === 'TEXT' ? { textContent: buffer.toString('utf8') } : {}),
     op: {
       opType: 'UPDATE',
       filePath: file.path,

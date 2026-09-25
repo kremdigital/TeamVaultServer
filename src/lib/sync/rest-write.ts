@@ -13,11 +13,10 @@
  * - не рассылалась подключённым клиентам.
  *
  * Здесь всё это собрано в одном месте: `applyOperation` (журнал + диск + Yjs
- * для CREATE) и публикация в канал сокет-процесса.
+ * для текста, общий с сокетом) и публикация в канал сокет-процесса.
  */
-import { Prisma, type FileType } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/db/client';
-import { writeYjsText } from '@/lib/crdt/persistence';
 import { applyOperation, type ApplyResult, type OperationInput } from './operation-log';
 import { getCount, increment, parseClock, type VectorClock } from './vector-clock';
 import { publishOperation, type OperationNotification } from '@/lib/realtime/bridge';
@@ -93,15 +92,6 @@ export interface RestWriteOpts {
   projectId: string;
   userId: string;
   op: OperationInput;
-  /**
-   * Текст файла — только для TEXT при `UPDATE`. `applyOperation` засевает
-   * `YjsDocument` при CREATE, но не при UPDATE: в сокет-протоколе текст идёт
-   * через `yjs:update`, а `file:update-binary` рассчитан на бинарники. У REST
-   * такого разделения нет, поэтому CRDT для текста пересобираем здесь — иначе
-   * диск и Yjs разойдутся.
-   */
-  textContent?: string;
-  fileType?: FileType;
 }
 
 /**
@@ -158,23 +148,12 @@ export async function applyRestOperation(opts: RestWriteOpts): Promise<ApplyResu
     opts.op,
   );
 
-  // Обновление CRDT для текстового UPDATE.
-  //
-  // ⚠️ Документ здесь МУТИРУЕТСЯ, а не подменяется свежим. Замена на
-  // `buildInitialState(newText)` кажется проще, но порождает задвоение: у
-  // такого документа своя история, клиент видит независимую вставку и Yjs
-  // сливает её с уже имеющимся текстом — на диске оказывается старое плюс
-  // новое. Это в точности механизм инцидента 2026-08-03 (см.
-  // `Tasks/done/2026-08-03-INCIDENT-рецидив-задвоения-ополченец.md`), и он
-  // воспроизвёлся при живом тесте MCP.
-  //
-  // При мутации в состояние попадает и УДАЛЕНИЕ прежнего текста, поэтому
-  // клиент, применив новое состояние, сходится к нужному содержимому. Тем же
-  // `writeYjsText` пользуется CREATE на существующей строке (оживление
-  // тумбстоуна, повтор конфликтной копии) — см. `applyCreate`.
-  if (opts.op.opType === 'UPDATE' && opts.fileType === 'TEXT' && opts.textContent !== undefined) {
-    await writeYjsText(opts.op.payload.fileId, opts.textContent);
-  }
+  // Текст заметки при `UPDATE` пишет в её `YjsDocument` сам `applyOperation`
+  // (`applyUpdate`), продолжая историю, — так же, как для сокетного
+  // `file:update-binary`. Раньше это делалось только здесь, после записи байтов:
+  // сокетный путь расходил диск и Y.Doc, а `UPDATE`, ставший no_op на
+  // тумбстоуне (удаление между проверкой роута и записью), всё равно менял
+  // документ удалённой заметки.
 
   // fileId берём из outcome: при CREATE он выдаётся сервером, при остальных
   // операциях приходит в payload. Без него плагин игнорирует событие.

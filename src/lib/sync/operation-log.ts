@@ -268,6 +268,21 @@ export function isRevivedCreate(payload: unknown): boolean {
   );
 }
 
+/**
+ * Whether a journal row is an UPDATE of a text file, by the type it recorded
+ * (see {@link applyUpdate}). Such an update went into the note's Y.Doc: it
+ * reaches clients as `yjs:update`, never as `file:updated-binary`.
+ */
+export function isTextUpdate(log: Pick<OperationLog, 'opType' | 'payload'>): boolean {
+  const payload = log.payload;
+  return (
+    log.opType === 'UPDATE' &&
+    typeof payload === 'object' &&
+    payload !== null &&
+    (payload as { fileType?: unknown }).fileType === 'TEXT'
+  );
+}
+
 // ---------------------------------------------------------------------------
 // CREATE
 // ---------------------------------------------------------------------------
@@ -330,8 +345,6 @@ async function applyCreate(
     conflictRenamed = true;
   }
 
-  await writeProjectFile(ctx.projectId, pathToUse, op.data);
-
   // `@@unique([projectId, path])` spans tombstones AND live rows, so a fresh
   // `create` at `pathToUse` blows up on the unique constraint whenever a row
   // already sits there — leaving the client stuck retrying the CREATE (and,
@@ -361,9 +374,14 @@ async function applyCreate(
   // re-created — "Untitled", a template, restore from trash) merged both texts
   // and pushed the duplicate to the whole team. Written before the row is
   // revived, so a `yjs:update` for the fileId can't be accepted against the
-  // old state in between.
+  // old state in between; and before the bytes, as in `applyUpdate`: a doc
+  // that can't be written leaves no bytes behind, and a pending snapshot of
+  // the old doc (the note edited right before its delete) that fires once the
+  // doc is written writes the new text, not the old one over the new bytes.
   const text = op.payload.fileType === 'TEXT' ? op.data.toString('utf8') : null;
   if (atPath && text !== null) await writeYjsText(atPath.id, text);
+
+  await writeProjectFile(ctx.projectId, pathToUse, op.data);
 
   const file = atPath
     ? await prisma.vaultFile.update({
@@ -447,6 +465,7 @@ async function applyUpdate(
   const payload = { ...op.payload, fileType: file.fileType };
 
   // DELETE > UPDATE conflict resolution: if the file is currently a tombstone, no-op.
+  // Its Y.Doc stays as it was too: a revival extends that history.
   if (file.deletedAt) {
     const log = await writeLog(ctx, {
       opType: 'UPDATE',
@@ -455,6 +474,20 @@ async function applyUpdate(
     });
     return { outcome: { kind: 'no_op', reason: 'tombstone' }, log };
   }
+
+  // A note's text lives in its Y.Doc: clients take it from there, and the
+  // server's snapshots write the doc's text over these bytes. So an UPDATE of
+  // a text file — REST PUT, MCP `write_note`, a plugin's `file:update-binary`
+  // ("Keep local") — writes the new text into the doc as well. Its history is
+  // EXTENDED (delete all + insert, `writeYjsText`), never replaced by a fresh
+  // doc: a client holding the old history applies the deletion and converges
+  // to the new text, where an independent history got merged with the old one
+  // into both texts (the duplication incident of 2026-08-03). Before, the
+  // socket path wrote only the bytes and the hash: the doc kept the old text,
+  // every client kept it, and the next snapshot wrote it back over the bytes.
+  // The doc goes first: a failure leaves the bytes untouched, and a pending
+  // snapshot that fires once the doc is written writes the new text as well.
+  if (file.fileType === 'TEXT') await writeYjsText(file.id, op.data.toString('utf8'));
 
   await writeProjectFile(ctx.projectId, file.path, op.data);
 

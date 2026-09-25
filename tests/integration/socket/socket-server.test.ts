@@ -18,7 +18,7 @@ import { applyRestOperation } from '@/lib/sync/rest-write';
 import { generateApiKey } from '@/lib/auth/api-key';
 import { signAccessToken } from '@/lib/auth/jwt';
 import { TEXT_KEY } from '@/lib/crdt/persistence';
-import { readStagedBlob, writeStagedBlob } from '@/lib/files/storage';
+import { readProjectFile, readStagedBlob, writeStagedBlob } from '@/lib/files/storage';
 import { sha256OfBuffer } from '@/lib/files/hash';
 import { resetDatabase, testPrisma } from '../db';
 
@@ -464,8 +464,6 @@ describe('project:join', () => {
     await applyRestOperation({
       projectId,
       userId,
-      fileType: 'TEXT',
-      textContent: 'old\nmcp\n',
       op: {
         opType: 'UPDATE',
         filePath: 'a.md',
@@ -476,7 +474,6 @@ describe('project:join', () => {
     await applyRestOperation({
       projectId,
       userId,
-      fileType: 'BINARY',
       op: {
         opType: 'UPDATE',
         filePath: 'img.png',
@@ -1023,6 +1020,169 @@ describe('file:* broadcasts (contract with the plugin)', () => {
     const deleted = nextEvent<FileEventPayload>(b, 'file:deleted');
     await emitWithAck(a, 'file:delete', { ...envelope, fileId, filePath: 'img/pic-2.png' });
     expect(await deleted).toMatchObject({ clientId: 'client-A', fileId });
+  });
+
+  it('file:update-binary of a note ("Keep local", plugin 0.3.x) goes into its Y.Doc and out as Yjs', async () => {
+    // A 0.3.x plugin answers "Keep local" in the content-conflict modal of a note
+    // by uploading its bytes as a binary update. The server wrote the bytes and
+    // the hash only: the Y.Doc kept the old text, every client (and the next
+    // snapshot) put it back, and `file:updated-binary` sent every device to
+    // download the note and ask again. Now it is REST PUT's path: the text goes
+    // into the doc, the history extended, and out as `yjs:update`.
+    const { projectId, a, b } = await twoMembersInRoom();
+    const seeded = nextEvent<{ fileId: string; update: number[] }>(b, 'yjs:update');
+    const created = await emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+      projectId,
+      clientId: 'client-A',
+      filePath: 'a.md',
+      fileType: 'TEXT',
+      contentHash: sha256OfBuffer(Buffer.from('old\n')),
+      size: 4,
+      data: Array.from(Buffer.from('old\n')),
+    });
+    const fileId = created.outcome.fileId;
+    // B holds the note's history and edits it; the server merges the edit.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Uint8Array.from((await seeded).update));
+    const sv = Y.encodeStateVector(peer);
+    peer.getText(TEXT_KEY).insert(4, 'mine\n');
+    const editReachedA = nextEvent(a, 'yjs:update');
+    await emitWithAck(b, 'yjs:update', {
+      projectId,
+      fileId,
+      update: Array.from(Y.encodeStateAsUpdate(peer, sv)),
+    });
+    await editReachedA;
+
+    const binaryEvents: string[] = [];
+    for (const [name, socket] of [
+      ['A', a],
+      ['B', b],
+    ] as const) {
+      socket.on('file:updated-binary', () => binaryEvents.push(name));
+    }
+    const toB = nextEvent<{ fileId: string; update: number[] }>(
+      b,
+      'yjs:update',
+      (m) => m.fileId === fileId,
+    );
+    const toSender = nextEvent<{ fileId: string; update: number[] }>(
+      a,
+      'yjs:update',
+      (m) => m.fileId === fileId,
+    );
+
+    // "Keep local": the plugin stages the bytes and sends the metadata only.
+    const local = Buffer.from('old\nlocal\n');
+    const contentHash = sha256OfBuffer(local);
+    await writeStagedBlob(projectId, contentHash, local);
+    const ack = await emitWithAck<{ ok: boolean; outcome?: unknown }>(a, 'file:update-binary', {
+      projectId,
+      clientId: 'client-A',
+      vectorClock: { 'client-A': 2 },
+      fileId,
+      contentHash,
+      size: local.byteLength,
+    });
+    // A plain success: a 0.3.x queue drops the entry instead of sending it again.
+    expect(ack).toEqual({ ok: true, outcome: { kind: 'updated', fileId } });
+
+    // Bytes, hash, Y.Doc and the version history agree on the kept text.
+    const row = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: fileId } });
+    expect(row.contentHash).toBe(contentHash);
+    expect((await readProjectFile(projectId, 'a.md')).toString('utf8')).toBe('old\nlocal\n');
+    const stored = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const server = new Y.Doc();
+    Y.applyUpdate(server, new Uint8Array(stored.state));
+    expect(server.getText(TEXT_KEY).toString()).toBe('old\nlocal\n');
+    const version = await testPrisma.fileVersion.findFirstOrThrow({
+      where: { fileId },
+      orderBy: { versionNumber: 'desc' },
+    });
+    expect(version.contentHash).toBe(contentHash);
+
+    // The peer, holding the old history, takes the text through Yjs and
+    // converges to exactly it: the old text's deletion is in the history.
+    Y.applyUpdate(peer, Uint8Array.from((await toB).update));
+    expect(peer.getText(TEXT_KEY).toString()).toBe('old\nlocal\n');
+    // The sender gets it too, so its doc drops the old text before it folds.
+    const senderDoc = new Y.Doc();
+    Y.applyUpdate(senderDoc, Uint8Array.from((await toSender).update));
+    expect(senderDoc.getText(TEXT_KEY).toString()).toBe('old\nlocal\n');
+
+    // The peer pushes whatever the server lacks: the note stays the kept text.
+    await emitWithAck(b, 'yjs:update', {
+      projectId,
+      fileId,
+      update: Array.from(Y.encodeStateAsUpdate(peer, new Uint8Array(stored.stateVector))),
+    });
+    const after = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const merged = new Y.Doc();
+    Y.applyUpdate(merged, new Uint8Array(after.state));
+    expect(merged.getText(TEXT_KEY).toString()).toBe('old\nlocal\n');
+
+    // No `file:updated-binary` for a note, to anyone: each broadcast went out
+    // before the ack, and B's round trip above came after it.
+    expect(binaryEvents).toEqual([]);
+
+    // A device that was away gets the kept text from the Yjs catch-up; the
+    // journal row of the update is not in the operations catch-up.
+    for (const flag of [{}, { operationsCatchup: FULL_CATCHUP_VERSION }]) {
+      const joined = await emitWithAck<{
+        operations: { opType: string }[];
+        yjsDocs: { fileId: string; sync1: number[] }[];
+      }>(b, 'project:join', { projectId, sinceVectorClock: {}, ...flag });
+      expect(joined.operations.map((o) => o.opType)).toEqual(['CREATE']);
+      const fresh = new Y.Doc();
+      const snapshot = joined.yjsDocs.find((d) => d.fileId === fileId);
+      Y.applyUpdate(fresh, Uint8Array.from(snapshot?.sync1 ?? []));
+      expect(fresh.getText(TEXT_KEY).toString()).toBe('old\nlocal\n');
+    }
+  });
+
+  it('file:update-binary of a deleted note: a plain no_op ack, nothing sent, the doc as it was', async () => {
+    // A 0.3.x queue can still hold a "Keep local" of a note deleted since. The
+    // ack must be a success, or the queue sends it again on every reconnect.
+    const { projectId, a, b } = await twoMembersInRoom();
+    const created = await emitWithAck<{ ok: true; outcome: { fileId: string } }>(a, 'file:create', {
+      projectId,
+      clientId: 'client-A',
+      filePath: 'gone.md',
+      fileType: 'TEXT',
+      contentHash: 'h-old',
+      size: 4,
+      data: Array.from(Buffer.from('old\n')),
+    });
+    const fileId = created.outcome.fileId;
+    await emitWithAck(a, 'file:delete', {
+      projectId,
+      clientId: 'client-A',
+      fileId,
+      filePath: 'gone.md',
+    });
+
+    const sent: string[] = [];
+    b.on('file:updated-binary', () => sent.push('file:updated-binary'));
+    b.on('yjs:update', (m: { fileId: string }) => {
+      if (m.fileId === fileId) sent.push('yjs:update');
+    });
+    const ack = await emitWithAck<{ ok: boolean; outcome?: unknown }>(a, 'file:update-binary', {
+      projectId,
+      clientId: 'client-A',
+      fileId,
+      contentHash: 'h-local',
+      size: 6,
+      data: Array.from(Buffer.from('local\n')),
+    });
+    expect(ack).toEqual({ ok: true, outcome: { kind: 'no_op', reason: 'tombstone' } });
+
+    const stored = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, new Uint8Array(stored.state));
+    expect(doc.getText(TEXT_KEY).toString()).toBe('old\n');
+    // B's round trip comes after anything sent before A's ack.
+    await emitWithAck(b, 'yjs:fetch', { projectId, fileId });
+    expect(sent).toEqual([]);
   });
 
   it('file:renamed after a conflict rename carries the stored path, the request as requestedPath', async () => {
