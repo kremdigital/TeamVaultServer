@@ -15,6 +15,10 @@ export interface CreatePayload {
   contentHash: string;
   size: number;
 }
+/**
+ * What a client sends. The journal row adds the file's `fileType` (see
+ * `applyUpdate`).
+ */
 export interface UpdatePayload {
   fileId: string;
   contentHash: string;
@@ -89,7 +93,19 @@ export async function applyOperation(ctx: ApplyContext, op: OperationInput): Pro
 }
 
 /**
- * Most operations one `project:join` catch-up returns (see
+ * The `operationsCatchup` value in `project:join` from which a client gets the
+ * whole-journal catch-up, {@link listOperationsSince}; the ack then carries
+ * `operationsCatchup: 2`. A client that doesn't send it (plugin 0.3.7 and
+ * older) gets {@link listLegacyOperationsSince}, what every earlier server gave.
+ * See `docs/sync-protocol.md`, «Подключение».
+ */
+export const FULL_CATCHUP_VERSION = 2 as const;
+
+/** How many of a project's OLDEST journal rows the legacy catch-up looks at. */
+export const LEGACY_CATCHUP_WINDOW = 500;
+
+/**
+ * Most operations one whole-journal catch-up returns (see
  * {@link listOperationsSince} and `docs/sync-protocol.md`, «Подключение»).
  *
  * A reconnect after a day offline misses tens to hundreds of operations; a
@@ -112,16 +128,65 @@ export interface OperationsSince {
   truncated: boolean;
 }
 
+/** The columns of an `OperationLog` row `o`, as Prisma returns them. */
+const OPERATION_COLUMNS = Prisma.sql`o."id", o."projectId", o."opType", o."filePath",
+  o."newPath", o."authorId", o."vectorClock", o."payload", o."createdAt"`;
+
 /**
- * The operations of a project the client has not seen: those whose clock is
- * not covered by `since`, i.e. has a counter above `since` for at least one
- * client. Oldest first, by `createdAt` and then `id`.
+ * The row `o` has a counter above `since` for at least one client: the client
+ * hasn't seen it. A clock that is not an object, or a counter that is not a
+ * number (the server never writes either), counts as seen rather than failing
+ * the query: the CASEs keep the casts off such values, since PostgreSQL
+ * doesn't promise to evaluate an AND left to right.
+ */
+function unseenBy(since: VectorClock): Prisma.Sql {
+  return Prisma.sql`EXISTS (
+    SELECT 1
+    FROM jsonb_each(
+      CASE WHEN jsonb_typeof(o."vectorClock") = 'object'
+           THEN o."vectorClock" ELSE '{}'::jsonb END
+    ) AS c(client, counter)
+    WHERE CASE WHEN jsonb_typeof(c.counter) = 'number'
+               THEN c.counter::numeric
+                    > COALESCE((${JSON.stringify(since)}::jsonb ->> c.client)::numeric, 0)
+               ELSE false END
+  )`;
+}
+
+/**
+ * The row `o` is an UPDATE of a text file: by the file's type now, or, once
+ * its row is gone, by the type the UPDATE recorded. No catch-up returns such a
+ * row. A note's text travels as Yjs, and the Yjs catch-up of the same join
+ * carries every note's state; the REST bridge doesn't broadcast
+ * `file:updated-binary` for text for the same reason. Plugins replay an UPDATE
+ * as a binary: they fetched the note's bytes and settled them by hashes over
+ * the CRDT merge. That showed a "Content conflict" prompt for a note edited
+ * both offline and through MCP, or silently dropped the offline edit for the
+ * whole team.
+ */
+const TEXT_UPDATE = Prisma.sql`(
+  o."opType" = 'UPDATE'
+  AND COALESCE(
+    (SELECT f."fileType"::text FROM "VaultFile" f
+      WHERE f."id" = o."payload" ->> 'fileId' AND f."projectId" = o."projectId"),
+    o."payload" ->> 'fileType',
+    ''
+  ) = 'TEXT'
+)`;
+
+/**
+ * The whole-journal catch-up, for a client that asks for it
+ * (`operationsCatchup` ≥ {@link FULL_CATCHUP_VERSION}): the operations of a
+ * project it has not seen, i.e. whose clock has a counter above `since` for at
+ * least one client, save text UPDATEs (see {@link TEXT_UPDATE}). Oldest first,
+ * by `createdAt` and then `id`.
  *
  * The filter runs in PostgreSQL, over the whole journal of the project, walked
- * newest first along `(projectId, createdAt)`: about 4 µs a row, 0.2 s for a
- * caught-up client of a 50 000-row journal; a fresh one stops at the limit. It
- * used to run here, over the 500 OLDEST rows of the project, so in a project
- * with a longer journal no new operation ever came back.
+ * newest first along `(projectId, createdAt)`. A caught-up client of a 50 000-row
+ * journal takes 0.1 s with a few clients in the clocks, 1 s with forty; a fresh
+ * one stops at the limit. The legacy catch-up ({@link listLegacyOperationsSince})
+ * looks only at the 500 OLDEST rows, so in a project with a longer journal no
+ * new operation ever comes back through it.
  *
  * With more unseen operations than `limit` (default
  * {@link CATCHUP_OPERATIONS_LIMIT}) the newest `limit` of them come back and
@@ -138,27 +203,14 @@ export async function listOperationsSince(opts: {
   const limit = opts.limit ?? CATCHUP_OPERATIONS_LIMIT;
   if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('invalid_limit');
   // The newest `limit + 1` unseen rows: the extra one says whether any were
-  // left out. A clock that is not an object, or a counter that is not a number
-  // (the server never writes either), counts as seen rather than failing the
-  // query: the CASEs keep the casts off such values, since PostgreSQL doesn't
-  // promise to evaluate an AND left to right.
+  // left out.
   const rows = await prisma.$queryRaw<OperationLog[]>(Prisma.sql`
     SELECT w.* FROM (
-      SELECT o."id", o."projectId", o."opType", o."filePath", o."newPath", o."authorId",
-             o."vectorClock", o."payload", o."createdAt"
+      SELECT ${OPERATION_COLUMNS}
       FROM "OperationLog" o
       WHERE o."projectId" = ${opts.projectId}
-        AND EXISTS (
-          SELECT 1
-          FROM jsonb_each(
-            CASE WHEN jsonb_typeof(o."vectorClock") = 'object'
-                 THEN o."vectorClock" ELSE '{}'::jsonb END
-          ) AS c(client, counter)
-          WHERE CASE WHEN jsonb_typeof(c.counter) = 'number'
-                     THEN c.counter::numeric
-                          > COALESCE((${JSON.stringify(opts.since)}::jsonb ->> c.client)::numeric, 0)
-                     ELSE false END
-        )
+        AND ${unseenBy(opts.since)}
+        AND NOT ${TEXT_UPDATE}
       ORDER BY o."createdAt" DESC, o."id" DESC
       LIMIT ${limit + 1}::int
     ) w
@@ -166,6 +218,39 @@ export async function listOperationsSince(opts: {
   `);
   const truncated = rows.length > limit;
   return { operations: truncated ? rows.slice(1) : rows, truncated };
+}
+
+/**
+ * The legacy catch-up, for a client that doesn't ask for the whole journal:
+ * the unseen operations among the project's {@link LEGACY_CATCHUP_WINDOW}
+ * OLDEST journal rows, oldest first, save text UPDATEs (see
+ * {@link TEXT_UPDATE}). Every server before gave every client this window, and
+ * in a project with a longer journal it holds no new operation at all.
+ *
+ * It stays for plugin 0.3.7 and older. They replay a catch-up against the
+ * files as they are now, and a stretch of history they already applied live
+ * (live broadcasts don't move their clock) undoes it. An attachment created
+ * and then renamed was downloaded again under its first name and uploaded as
+ * a new file for the whole team; an intermediate rename onto a name another
+ * note holds now set that note aside as a `.conflict-<ts>` copy and uploaded
+ * it. The whole-journal catch-up handed them exactly such stretches.
+ */
+export async function listLegacyOperationsSince(opts: {
+  projectId: string;
+  since: VectorClock;
+}): Promise<OperationLog[]> {
+  return prisma.$queryRaw<OperationLog[]>(Prisma.sql`
+    SELECT ${OPERATION_COLUMNS}
+    FROM (
+      SELECT * FROM "OperationLog"
+      WHERE "projectId" = ${opts.projectId}
+      ORDER BY "createdAt" ASC, "id" ASC
+      LIMIT ${LEGACY_CATCHUP_WINDOW}::int
+    ) o
+    WHERE ${unseenBy(opts.since)}
+      AND NOT ${TEXT_UPDATE}
+    ORDER BY o."createdAt" ASC, o."id" ASC
+  `);
 }
 
 /**
@@ -347,7 +432,7 @@ async function applyUpdate(
 ): Promise<ApplyResult> {
   const file = await prisma.vaultFile.findFirst({
     where: { id: op.payload.fileId, projectId: ctx.projectId },
-    select: { id: true, path: true, deletedAt: true },
+    select: { id: true, path: true, deletedAt: true, fileType: true },
   });
   if (!file) {
     // Message intentionally ends with `_not_found` — the plugin's
@@ -356,12 +441,17 @@ async function applyUpdate(
     throw new Error('file_not_found');
   }
 
+  // The row records the file's type: the catch-up leaves out UPDATEs of text
+  // (their content goes as Yjs), and it still knows one once the file's row is
+  // gone. The server's value, after the spread: never the client's.
+  const payload = { ...op.payload, fileType: file.fileType };
+
   // DELETE > UPDATE conflict resolution: if the file is currently a tombstone, no-op.
   if (file.deletedAt) {
     const log = await writeLog(ctx, {
       opType: 'UPDATE',
       filePath: file.path,
-      payload: { ...op.payload, suppressed: 'tombstone' } as Prisma.InputJsonValue,
+      payload: { ...payload, suppressed: 'tombstone' } as Prisma.InputJsonValue,
     });
     return { outcome: { kind: 'no_op', reason: 'tombstone' }, log };
   }
@@ -380,7 +470,7 @@ async function applyUpdate(
   const log = await writeLog(ctx, {
     opType: 'UPDATE',
     filePath: file.path,
-    payload: op.payload as unknown as Prisma.InputJsonValue,
+    payload: payload as unknown as Prisma.InputJsonValue,
   });
   return { outcome: { kind: 'updated', fileId: file.id }, log };
 }

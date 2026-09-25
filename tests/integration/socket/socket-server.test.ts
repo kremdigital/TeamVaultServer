@@ -8,7 +8,12 @@ import { Server as IOServer, type ServerOptions } from 'socket.io';
 import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
 import { createIoServer } from '@/socket/server';
 import { relay } from '@/socket/rest-bridge';
-import { CATCHUP_OPERATIONS_LIMIT, type ApplyResult } from '@/lib/sync/operation-log';
+import {
+  applyOperation,
+  CATCHUP_OPERATIONS_LIMIT,
+  FULL_CATCHUP_VERSION,
+  type ApplyResult,
+} from '@/lib/sync/operation-log';
 import { applyRestOperation } from '@/lib/sync/rest-write';
 import { generateApiKey } from '@/lib/auth/api-key';
 import { signAccessToken } from '@/lib/auth/jwt';
@@ -276,10 +281,41 @@ describe('project:join', () => {
       ok: true;
       operations: { filePath: string; vectorClock: Record<string, number> }[];
       operationsTruncated?: boolean;
+      operationsCatchup?: number;
     };
 
-    it('returns the operations the client has not seen, new ones at the end', async () => {
+    /** Every shape of the join a client sends. */
+    const JOIN_SHAPES = [{}, { streamYjs: true }, { skipYjsCatchup: true }];
+
+    it('with operationsCatchup: 2, returns the unseen operations, new ones at the end', async () => {
       const { userId, plainKey } = await bootstrapUserAndKey('long-journal');
+      const project = await createProject(userId);
+      await seedJournal(project.id, 603);
+
+      const c = connect(plainKey);
+      await new Promise<void>((resolve) => c.on('connect', () => resolve()));
+      for (const extra of JOIN_SHAPES) {
+        const ack = await emitWithAck<OpsAck>(c, 'project:join', {
+          projectId: project.id,
+          sinceVectorClock: { A: 600 },
+          operationsCatchup: FULL_CATCHUP_VERSION,
+          ...extra,
+        });
+
+        expect(ack.ok).toBe(true);
+        expect(ack.operations.map((o) => o.filePath)).toEqual([
+          'A-601.bin',
+          'A-602.bin',
+          'A-603.bin',
+        ]);
+        expect(ack.operations[2]?.vectorClock).toEqual({ A: 603 });
+        expect(ack.operationsCatchup).toBe(2);
+        expect('operationsTruncated' in ack).toBe(false);
+      }
+    });
+
+    it('a catch-up version above 2 gets version 2, and the echo says so', async () => {
+      const { userId, plainKey } = await bootstrapUserAndKey('newer-client');
       const project = await createProject(userId);
       await seedJournal(project.id, 603);
 
@@ -287,18 +323,46 @@ describe('project:join', () => {
       await new Promise<void>((resolve) => c.on('connect', () => resolve()));
       const ack = await emitWithAck<OpsAck>(c, 'project:join', {
         projectId: project.id,
-        sinceVectorClock: { A: 600 },
-        streamYjs: true,
+        sinceVectorClock: { A: 602 },
+        operationsCatchup: 3,
       });
 
-      expect(ack.ok).toBe(true);
-      expect(ack.operations.map((o) => o.filePath)).toEqual([
-        'A-601.bin',
-        'A-602.bin',
-        'A-603.bin',
-      ]);
-      expect(ack.operations[2]?.vectorClock).toEqual({ A: 603 });
-      expect('operationsTruncated' in ack).toBe(false);
+      expect(ack.operations.map((o) => o.filePath)).toEqual(['A-603.bin']);
+      expect(ack.operationsCatchup).toBe(2);
+    });
+
+    it('without operationsCatchup (plugin 0.3.7), gets the 500 oldest rows and no echo', async () => {
+      const { userId, plainKey } = await bootstrapUserAndKey('old-plugin');
+      const project = await createProject(userId);
+      await seedJournal(project.id, 603);
+
+      const c = connect(plainKey);
+      await new Promise<void>((resolve) => c.on('connect', () => resolve()));
+      // Plugin 0.3.7 sends none; a version below 2 or not a number is none.
+      for (const flag of [{}, { operationsCatchup: 1 }, { operationsCatchup: '2' }]) {
+        for (const extra of JOIN_SHAPES) {
+          // The unseen rows inside the window come back, and nothing past it:
+          // a 0.3.7 device of this project has the window's clock.
+          const inWindow = await emitWithAck<OpsAck>(c, 'project:join', {
+            projectId: project.id,
+            sinceVectorClock: { A: 498 },
+            ...flag,
+            ...extra,
+          });
+          expect(inWindow.operations.map((o) => o.filePath)).toEqual(['A-499.bin', 'A-500.bin']);
+          expect('operationsCatchup' in inWindow).toBe(false);
+          expect('operationsTruncated' in inWindow).toBe(false);
+
+          const past = await emitWithAck<OpsAck>(c, 'project:join', {
+            projectId: project.id,
+            sinceVectorClock: { A: 500 },
+            ...flag,
+            ...extra,
+          });
+          expect(past.operations).toEqual([]);
+          expect('operationsCatchup' in past).toBe(false);
+        }
+      }
     });
 
     it('past the limit, sends the newest operations and operationsTruncated', async () => {
@@ -308,13 +372,15 @@ describe('project:join', () => {
 
       const c = connect(plainKey);
       await new Promise<void>((resolve) => c.on('connect', () => resolve()));
-      // Every legacy shape of the join: the flag is on each.
-      for (const extra of [{}, { streamYjs: true }, { skipYjsCatchup: true }]) {
+      // Every shape of the join: the flag is on each.
+      for (const extra of JOIN_SHAPES) {
         const ack = await emitWithAck<OpsAck>(c, 'project:join', {
           projectId: project.id,
           sinceVectorClock: {},
+          operationsCatchup: FULL_CATCHUP_VERSION,
           ...extra,
         });
+        expect(ack.operationsCatchup).toBe(2);
         expect(ack.operationsTruncated).toBe(true);
         expect(ack.operations).toHaveLength(CATCHUP_OPERATIONS_LIMIT);
         expect(ack.operations[0]?.filePath).toBe('A-2.bin');
@@ -333,12 +399,14 @@ describe('project:join', () => {
         projectId: project.id,
         skipYjsCatchup: true,
         skipOperations: true,
+        operationsCatchup: FULL_CATCHUP_VERSION,
       });
 
       expect(ack.ok).toBe(true);
       expect(ack.operations).toEqual([]);
       expect(ack.yjsSkipped).toBe(true);
       expect('operationsTruncated' in ack).toBe(false);
+      expect('operationsCatchup' in ack).toBe(false);
 
       // Joined all the same: a teammate's operation reaches it live.
       type Created = { clientId?: string; result: { outcome: { path?: string } } };
@@ -361,6 +429,79 @@ describe('project:join', () => {
       expect(event.clientId).toBe('peer');
       expect(event.result.outcome.path).toBe('live.md');
     });
+  });
+
+  it('a note written through REST or MCP comes back as Yjs, never as an UPDATE', async () => {
+    const { userId, plainKey } = await bootstrapUserAndKey('mcp-writer');
+    const project = await createProject(userId);
+    const projectId = project.id;
+    // A plugin creates a note and an attachment.
+    const byPlugin = (n: number) => ({
+      projectId,
+      authorId: userId,
+      clientId: 'A',
+      vectorClock: { A: n },
+    });
+    const note = await applyOperation(byPlugin(1), {
+      opType: 'CREATE',
+      filePath: 'a.md',
+      payload: { fileType: 'TEXT', contentHash: 'h-old', size: 4 },
+      data: Buffer.from('old\n'),
+    });
+    const img = await applyOperation(byPlugin(2), {
+      opType: 'CREATE',
+      filePath: 'img.png',
+      payload: { fileType: 'BINARY', contentHash: 'h-png1', size: 4 },
+      data: Buffer.from('PNG1'),
+    });
+    if (note.outcome.kind !== 'created' || img.outcome.kind !== 'created') {
+      throw new Error('expected created');
+    }
+    const noteId = note.outcome.fileId;
+    const imgId = img.outcome.fileId;
+    // MCP `write_note` (REST PUT) rewrites the note, the web UI replaces the
+    // attachment.
+    await applyRestOperation({
+      projectId,
+      userId,
+      fileType: 'TEXT',
+      textContent: 'old\nmcp\n',
+      op: {
+        opType: 'UPDATE',
+        filePath: 'a.md',
+        payload: { fileId: noteId, contentHash: 'h-new', size: 8 },
+        data: Buffer.from('old\nmcp\n'),
+      },
+    });
+    await applyRestOperation({
+      projectId,
+      userId,
+      fileType: 'BINARY',
+      op: {
+        opType: 'UPDATE',
+        filePath: 'img.png',
+        payload: { fileId: imgId, contentHash: 'h-png2', size: 4 },
+        data: Buffer.from('PNG2'),
+      },
+    });
+
+    const c = connect(plainKey);
+    await new Promise<void>((resolve) => c.on('connect', () => resolve()));
+    // A device that saw both creations, legacy catch-up and whole-journal alike.
+    for (const flag of [{}, { operationsCatchup: FULL_CATCHUP_VERSION }]) {
+      const ack = await emitWithAck<{
+        ok: true;
+        operations: { opType: string; filePath: string }[];
+        yjsDocs: { fileId: string; sync1: number[] }[];
+      }>(c, 'project:join', { projectId, sinceVectorClock: { A: 2 }, ...flag });
+
+      expect(ack.operations.map((o) => `${o.opType} ${o.filePath}`)).toEqual(['UPDATE img.png']);
+      // The note's new text is in its Yjs state, the way every client takes it.
+      const state = ack.yjsDocs.find((d) => d.fileId === noteId);
+      const replica = new Y.Doc();
+      Y.applyUpdate(replica, Uint8Array.from(state?.sync1 ?? []));
+      expect(replica.getText(TEXT_KEY).toString()).toBe('old\nmcp\n');
+    }
   });
 
   it('refuses join for a non-member project', async () => {

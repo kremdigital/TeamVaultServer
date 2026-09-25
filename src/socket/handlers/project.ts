@@ -2,7 +2,11 @@ import * as Y from 'yjs';
 import type { Server, Socket } from 'socket.io';
 import { prisma } from '@/lib/db/client';
 import { canViewProject, loadProjectAccess } from '@/lib/auth/permissions';
-import { listOperationsSince } from '@/lib/sync/operation-log';
+import {
+  FULL_CATCHUP_VERSION,
+  listLegacyOperationsSince,
+  listOperationsSince,
+} from '@/lib/sync/operation-log';
 import { type VectorClock, parseClock } from '@/lib/sync/vector-clock';
 import { buildInitialState } from '@/lib/crdt/persistence';
 import { readProjectFile } from '@/lib/files/storage';
@@ -38,6 +42,14 @@ export interface JoinPayload {
    * (`CATCHUP_OPERATIONS_LIMIT`, megabytes) to every note it opened.
    */
   skipOperations?: boolean;
+  /**
+   * The op-log catch-up the client can replay. From `FULL_CATCHUP_VERSION` (2)
+   * up: every operation it hasn't seen, from the whole journal
+   * (`listOperationsSince`). Anything else, or nothing (plugin 0.3.7 and
+   * older): the legacy catch-up (`listLegacyOperationsSince`), which a client
+   * that replays against the files as they are now survives.
+   */
+  operationsCatchup?: number;
 }
 
 export interface YjsDocSnapshot {
@@ -62,9 +74,15 @@ export interface JoinAckPayload {
     createdAt: Date;
   }>;
   /**
+   * `FULL_CATCHUP_VERSION` when `operations` is the whole-journal catch-up the
+   * client asked for. Absent for the legacy one and with `skipOperations`: a
+   * client that asked and got no echo talks to a server that ignored the flag.
+   */
+  operationsCatchup?: typeof FULL_CATCHUP_VERSION;
+  /**
    * Present (always `true`) when the client had more unseen operations than
-   * one catch-up returns: `operations` holds the newest of them, the older ones
-   * are left out. Older clients ignore it.
+   * one whole-journal catch-up returns: `operations` holds the newest of them,
+   * the older ones are left out. Older clients ignore it.
    */
   operationsTruncated?: true;
   /**
@@ -130,21 +148,31 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
 
     await socket.join(projectRoom(payload.projectId));
 
-    // 1) Operation log catch-up.
+    // 1) Operation log catch-up: the whole journal for a client that asks for
+    //    it, the legacy window of the 500 oldest rows for any other.
+    const since = payload.sinceVectorClock ?? {};
+    const full =
+      !payload.skipOperations && (payload.operationsCatchup ?? 0) >= FULL_CATCHUP_VERSION;
     const { operations: ops, truncated } = payload.skipOperations
       ? { operations: [], truncated: false }
-      : await listOperationsSince({
-          projectId: payload.projectId,
-          since: payload.sinceVectorClock ?? {},
-        });
+      : full
+        ? await listOperationsSince({ projectId: payload.projectId, since })
+        : {
+            operations: await listLegacyOperationsSince({ projectId: payload.projectId, since }),
+            truncated: false,
+          };
     if (truncated) {
       log.warn(
         { projectId: payload.projectId, ops: ops.length },
         'project:join: catch-up truncated to the newest operations',
       );
     }
-    // Additive: set only when older unseen operations were left out.
-    const truncation = truncated ? { operationsTruncated: true as const } : {};
+    // Additive: the echo only for the whole-journal catch-up, the truncation
+    // flag only when older unseen operations were left out of it.
+    const truncation = {
+      ...(full ? { operationsCatchup: FULL_CATCHUP_VERSION } : {}),
+      ...(truncated ? { operationsTruncated: true as const } : {}),
+    };
     const operations = ops.map((o) => ({
       id: o.id,
       opType: o.opType,
@@ -292,5 +320,8 @@ function parseJoinPayload(raw: unknown): JoinPayload | null {
     streamYjs: data['streamYjs'] === true,
     skipYjsCatchup: data['skipYjsCatchup'] === true,
     skipOperations: data['skipOperations'] === true,
+    ...(typeof data['operationsCatchup'] === 'number'
+      ? { operationsCatchup: data['operationsCatchup'] }
+      : {}),
   };
 }
