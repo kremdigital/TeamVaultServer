@@ -1071,21 +1071,43 @@ describe('file:* broadcasts (contract with the plugin)', () => {
       'yjs:update',
       (m) => m.fileId === fileId,
     );
+    // What the sender sees, and in which order: the ack is recorded in its
+    // callback, as the packet arrives, not after an `await`.
+    const atSender: string[] = [];
+    a.on('yjs:update', (m: { fileId: string }) => {
+      if (m.fileId === fileId) atSender.push('yjs:update');
+    });
 
     // "Keep local": the plugin stages the bytes and sends the metadata only.
     const local = Buffer.from('old\nlocal\n');
     const contentHash = sha256OfBuffer(local);
     await writeStagedBlob(projectId, contentHash, local);
-    const ack = await emitWithAck<{ ok: boolean; outcome?: unknown }>(a, 'file:update-binary', {
-      projectId,
-      clientId: 'client-A',
-      vectorClock: { 'client-A': 2 },
-      fileId,
-      contentHash,
-      size: local.byteLength,
+    const ack = await new Promise<{ ok: boolean; outcome?: unknown }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('ack timeout')), 5000);
+      a.emit(
+        'file:update-binary',
+        {
+          projectId,
+          clientId: 'client-A',
+          vectorClock: { 'client-A': 2 },
+          fileId,
+          contentHash,
+          size: local.byteLength,
+        },
+        (res: { ok: boolean; outcome?: unknown }) => {
+          clearTimeout(timer);
+          atSender.push('ack');
+          resolve(res);
+        },
+      );
     });
     // A plain success: a 0.3.x queue drops the entry instead of sending it again.
     expect(ack).toEqual({ ok: true, outcome: { kind: 'updated', fileId } });
+    // The doc state reaches the sender before the ack: its doc holds the kept
+    // text before the plugin, done with the conflict, folds the disk into it.
+    // The ack first, and a fold in between would edit a doc that still has the
+    // old text (see docs/sync-protocol.md, "UPDATE текстового файла").
+    expect(atSender).toEqual(['yjs:update', 'ack']);
 
     // Bytes, hash, Y.Doc and the version history agree on the kept text.
     const row = await testPrisma.vaultFile.findUniqueOrThrow({ where: { id: fileId } });

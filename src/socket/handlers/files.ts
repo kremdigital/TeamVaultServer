@@ -181,7 +181,9 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
         // `applyOperation` wrote the text into its Y.Doc, the history
         // extended, like REST PUT. It goes out the way REST PUT's does through
         // the bridge: the whole doc state as `yjs:update`, to the sender too,
-        // so its doc takes the deletion of the old text before its next fold.
+        // and BEFORE the ack (a test holds the order), so its doc has the new
+        // text before any fold of the disk after the ack: folded into the old
+        // text, the kept lines would be inserted twice, by the server and by it.
         // Never `file:updated-binary`: a plugin downloads the bytes of such an
         // update and settles them by hashes over the CRDT merge, i.e. the
         // content-conflict modal again, on every device. A no-op (the note is
