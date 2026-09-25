@@ -329,6 +329,32 @@ describe('applyOperation: CREATE on a tombstone extends the Y.Doc history', () =
     expect(textOf(await storedState(fileId))).toBe(NEW);
   });
 
+  it("an unsent edit of the deleted note stays whole next to the new note's text", async () => {
+    // A new note under the old id has a text of its own: the old one is deleted
+    // whole and the new one inserted whole. A diff would build the new text out
+    // of the old one's letters, and the device's edit would land inside its words.
+    const { projectId, ownerId } = await seedProject();
+    const { fileId, device } = await noteWithDeviceHistory(projectId, ownerId);
+    device.getText(TEXT_KEY).insert(OLD.indexOf('two'), 'X ');
+
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 1 } },
+      { opType: 'DELETE', filePath: 'a.md', payload: { fileId } },
+    );
+    await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'B', vectorClock: { B: 2 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-new', size: NEW.length },
+        data: Buffer.from(NEW),
+      },
+    );
+
+    Y.applyUpdate(device, await storedState(fileId));
+    expect(device.getText(TEXT_KEY).toString()).toBe(`X ${NEW}`);
+  });
+
   it('restoring the same text (from the trash) does not double it', async () => {
     const { projectId, ownerId } = await seedProject();
     const { fileId, device } = await noteWithDeviceHistory(projectId, ownerId);
@@ -678,6 +704,65 @@ describe('applyOperation: UPDATE of a note writes its text into the Y.Doc', () =
     const stored = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
     Y.applyUpdate(device, new Uint8Array(stored.state));
     expect(device.getText(TEXT_KEY).toString()).toBe(KEPT);
+  });
+
+  it("a device's unsent edits land where it made them (MCP write_note of another line)", async () => {
+    // The device holds the note's history (y-indexeddb) and edits it offline while
+    // an MCP agent rewrites another line through REST PUT. The server deleted the
+    // whole text and inserted the new one at 0: for the whole team the insertion
+    // inside a line went to the start of the note, the deleted line came back and
+    // the replaced word doubled ("BETAbeta").
+    const { projectId, ownerId } = await seedProject();
+    const BASE = 'alpha beta\ngamma\ndelta\n';
+    const created = await applyOperation(
+      { projectId, authorId: ownerId, clientId: 'A', vectorClock: { A: 1 } },
+      {
+        opType: 'CREATE',
+        filePath: 'a.md',
+        payload: { fileType: 'TEXT', contentHash: 'h-base', size: BASE.length },
+        data: Buffer.from(BASE),
+      },
+    );
+    if (created.outcome.kind !== 'created') throw new Error('expected created');
+    const fileId = created.outcome.fileId;
+    const seeded = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    const device = new Y.Doc();
+    Y.applyUpdate(device, new Uint8Array(seeded.state));
+
+    // Offline: inside a line, a replaced word, a deleted line, a line at the end.
+    const text = device.getText(TEXT_KEY);
+    text.insert(1, '2');
+    text.delete(text.toString().indexOf('beta'), 'beta'.length);
+    text.insert(text.toString().indexOf('\n'), 'BETA');
+    text.delete(text.toString().indexOf('delta'), 'delta\n'.length);
+    text.insert(text.length, 'offline\n');
+    expect(text.toString()).toBe('a2lpha BETA\ngamma\noffline\n');
+
+    const MCP = 'alpha beta\nGAMMA\ndelta\n';
+    const rest = await applyRestOperation({
+      projectId,
+      userId: ownerId,
+      op: {
+        opType: 'UPDATE',
+        filePath: 'a.md',
+        payload: { fileId, contentHash: 'h-mcp', size: MCP.length },
+        data: Buffer.from(MCP),
+      },
+    });
+    expect(rest.outcome.kind).toBe('updated');
+    expect(await docText(fileId)).toBe(MCP);
+
+    // The device connects: it sends what the server lacks, then takes the doc.
+    const written = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    await applyYjsUpdate({
+      fileId,
+      update: Y.encodeStateAsUpdate(device, new Uint8Array(written.stateVector)),
+      authorId: ownerId,
+    });
+    const merged = await testPrisma.yjsDocument.findUniqueOrThrow({ where: { fileId } });
+    Y.applyUpdate(device, new Uint8Array(merged.state));
+    expect(await docText(fileId)).toBe('a2lpha BETA\nGAMMA\noffline\n');
+    expect(device.getText(TEXT_KEY).toString()).toBe('a2lpha BETA\nGAMMA\noffline\n');
   });
 
   it('an attachment gets no Y.Doc', async () => {

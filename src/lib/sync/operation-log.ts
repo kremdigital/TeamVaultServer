@@ -368,7 +368,10 @@ async function applyCreate(
   //
   // A row that already exists (tombstone or live conflict copy) keeps its id,
   // so its Y.Doc keeps its HISTORY: the new text goes on top of the stored one
-  // (delete all + insert), exactly like a REST UPDATE. Replacing it with
+  // (`writeYjsText`). It is a new note under the old id, with a text of its own,
+  // so the old text is deleted whole and the new one inserted whole (`'replace'`):
+  // a diff would stitch the new text out of the old one's letters, and edits of
+  // the old note would land inside its words. Replacing it with
   // `buildInitialState` gave the same fileId an independent history, and every
   // device still holding the old one (offline while the note was deleted and
   // re-created — "Untitled", a template, restore from trash) merged both texts
@@ -379,7 +382,7 @@ async function applyCreate(
   // the old doc (the note edited right before its delete) that fires once the
   // doc is written writes the new text, not the old one over the new bytes.
   const text = op.payload.fileType === 'TEXT' ? op.data.toString('utf8') : null;
-  if (atPath && text !== null) await writeYjsText(atPath.id, text);
+  if (atPath && text !== null) await writeYjsText(atPath.id, text, 'replace');
 
   await writeProjectFile(ctx.projectId, pathToUse, op.data);
 
@@ -410,7 +413,7 @@ async function applyCreate(
       });
 
   // A brand-new row has no stored doc: this seeds a fresh one.
-  if (!atPath && text !== null) await writeYjsText(file.id, text);
+  if (!atPath && text !== null) await writeYjsText(file.id, text, 'replace');
 
   const log = await writeLog(ctx, {
     opType: 'CREATE',
@@ -479,15 +482,20 @@ async function applyUpdate(
   // server's snapshots write the doc's text over these bytes. So an UPDATE of
   // a text file — REST PUT, MCP `write_note`, a plugin's `file:update-binary`
   // ("Keep local") — writes the new text into the doc as well. Its history is
-  // EXTENDED (delete all + insert, `writeYjsText`), never replaced by a fresh
-  // doc: a client holding the old history applies the deletion and converges
-  // to the new text, where an independent history got merged with the old one
-  // into both texts (the duplication incident of 2026-08-03). Before, the
+  // EXTENDED (`writeYjsText`), never replaced by a fresh doc: a client holding
+  // the old history applies the edit and converges to the new text, where an
+  // independent history got merged with the old one into both texts (the
+  // duplication incident of 2026-08-03). The edit is a minimal diff (`'edit'`):
+  // the untouched text keeps its Yjs items, so edits a device made meanwhile
+  // and hasn't sent yet land where they were made. Deleting the whole text and
+  // inserting the new one moved them: an insertion inside a line went to the
+  // start of the note, a line deleted offline came back, a replaced word
+  // doubled ("ALPHAalpha"). Before, the
   // socket path wrote only the bytes and the hash: the doc kept the old text,
   // every client kept it, and the next snapshot wrote it back over the bytes.
   // The doc goes first: a failure leaves the bytes untouched, and a pending
   // snapshot that fires once the doc is written writes the new text as well.
-  if (file.fileType === 'TEXT') await writeYjsText(file.id, op.data.toString('utf8'));
+  if (file.fileType === 'TEXT') await writeYjsText(file.id, op.data.toString('utf8'), 'edit');
 
   await writeProjectFile(ctx.projectId, file.path, op.data);
 

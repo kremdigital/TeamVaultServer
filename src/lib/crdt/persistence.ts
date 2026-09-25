@@ -1,3 +1,4 @@
+import { diffChars, diffLines, type ChangeObject } from 'diff';
 import * as Y from 'yjs';
 import { prisma } from '@/lib/db/client';
 import { sha256OfBuffer } from '@/lib/files/hash';
@@ -229,23 +230,148 @@ export function buildInitialState(text: string): {
 }
 
 /**
+ * Как новый текст ложится на сохранённую историю документа.
+ *
+ * - `'edit'` — правка той же заметки: `UPDATE` (REST `PUT`, MCP `write_note`,
+ *   сокетный `file:update-binary`). Минимальный дифф ({@link editYText}):
+ *   неизменённые участки сохраняют свои элементы Yjs, и правки, которые устройство
+ *   сделало параллельно и ещё не отправило, при слиянии встают на свои места.
+ * - `'replace'` — новая заметка под прежним id: `CREATE` на тумбстоуне. Весь
+ *   прежний текст удаляется, новый вставляется целиком. Со старой заметкой у
+ *   нового текста нет ничего общего: дифф собрал бы его из её букв, и правки
+ *   старой заметки попали бы внутрь его слов. Так они встают целиком у края.
+ */
+export type TextWriteMode = 'edit' | 'replace';
+
+/** Пределы диффа в {@link editYText}. */
+export interface TextDiffLimits {
+  /** Сколько символов посимвольный дифф может вставить и удалить в сумме. */
+  chars: number;
+  /** Сколько строк может вставить и удалить построчный дифф (запасной путь). */
+  lines: number;
+  /** Время на каждый дифф, мс. */
+  timeoutMs: number;
+}
+
+/**
+ * Посимвольный дифф (Myers) стоит порядка квадрата числа правок: переписанная
+ * заметка в 20 КБ считается секунды, а запись идёт в обработчике запроса. Правка
+ * побольше идёт построчным диффом, а если и он не укладывается — одним куском.
+ */
+export const TEXT_DIFF_LIMITS: TextDiffLimits = { chars: 1000, lines: 2000, timeoutMs: 250 };
+
+/**
+ * Привести `ytext` к `text` минимальной правкой. Вызывать внутри транзакции.
+ *
+ * Сначала посимвольный дифф jsdiff — тот же `diffChars`, что у `applyTextDiff`
+ * плагина, когда он вливает диск в документ. Если правка не укладывается в
+ * {@link TextDiffLimits}, то построчный дифф; если и он не укладывается, заменяется
+ * одним куском всё от первого до последнего различия. Результат всегда ровно
+ * `text`. Пары суррогатов не разрезаются: jsdiff делит текст по кодовым точкам и
+ * строкам, а кусок выравнивается по кодовым точкам. Разрезанную пару Yjs
+ * превращает в U+FFFD.
+ *
+ * Возвращает, каким путём прошла правка (для тестов).
+ */
+export function editYText(
+  ytext: Y.Text,
+  text: string,
+  limits: TextDiffLimits = TEXT_DIFF_LIMITS,
+): 'none' | 'chars' | 'lines' | 'span' {
+  const current = ytext.toString();
+  if (current === text) return 'none';
+
+  const chars = diffChars(current, text, {
+    maxEditLength: limits.chars,
+    timeout: limits.timeoutMs,
+  });
+  if (chars) {
+    applyChanges(ytext, chars);
+    return 'chars';
+  }
+  const lines = diffLines(current, text, {
+    maxEditLength: limits.lines,
+    timeout: limits.timeoutMs,
+  });
+  if (lines) {
+    applyChanges(ytext, lines);
+    return 'lines';
+  }
+  replaceSpan(ytext, current, text);
+  return 'span';
+}
+
+/** Применить части диффа jsdiff к тексту, слева направо. */
+function applyChanges(ytext: Y.Text, changes: ChangeObject<string>[]): void {
+  let cursor = 0;
+  for (const change of changes) {
+    if (change.added) {
+      ytext.insert(cursor, change.value);
+      cursor += change.value.length;
+    } else if (change.removed) {
+      ytext.delete(cursor, change.value.length);
+    } else {
+      cursor += change.value.length;
+    }
+  }
+}
+
+/** Заменить всё от первого различия до последнего одним куском. */
+function replaceSpan(ytext: Y.Text, current: string, text: string): void {
+  const limit = Math.min(current.length, text.length);
+  let start = 0;
+  while (start < limit && current.charCodeAt(start) === text.charCodeAt(start)) start += 1;
+  // Не резать пару: общий старший суррогат уходит в заменяемый кусок.
+  if (start > 0 && isHighSurrogate(current.charCodeAt(start - 1))) start -= 1;
+  let end = 0;
+  while (
+    end < limit - start &&
+    current.charCodeAt(current.length - 1 - end) === text.charCodeAt(text.length - 1 - end)
+  ) {
+    end += 1;
+  }
+  // Общий суффикс не начинается с младшего суррогата, отделённого от своей пары.
+  if (end > 0 && isLowSurrogate(current.charCodeAt(current.length - end))) end -= 1;
+  const removed = current.length - end - start;
+  if (removed > 0) ytext.delete(start, removed);
+  const inserted = text.slice(start, text.length - end);
+  if (inserted.length > 0) ytext.insert(start, inserted);
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
  * Привести сохранённое состояние Y.Doc к тексту `text`, **продолжая** его
- * историю: удалить весь прежний текст и вставить новый поверх, в одной
- * транзакции. Если текст уже совпадает, история не трогается (`changed: false`).
- * Без сохранённого состояния (`stored` пуст) получается свежий документ — то же,
- * что {@link buildInitialState}.
+ * историю, одной транзакцией: при `'edit'` — минимальной правкой, при `'replace'`
+ * — удалив весь прежний текст и вставив новый (см. {@link TextWriteMode}). Если
+ * текст уже совпадает, история не трогается (`changed: false`). Без сохранённого
+ * состояния (`stored` пуст) получается свежий документ — то же, что
+ * {@link buildInitialState}.
  *
  * ⚠️ Существующий документ нельзя подменять свежим (`buildInitialState`). У
  * свежего документа своя, независимая история: клиент, который хранит прежнюю
  * (в y-indexeddb, в открытом редакторе), при слиянии получает ОБА текста —
  * старый и новый подряд, и отправляет задвоение всей команде. Это механизм
- * инцидентов задвоения 2026-08-03 и оживления тумбстоуна (ревью 0.3.8). Удаление
- * прежнего текста, записанное в историю, клиент со старой историей применяет и
- * сходится ровно к `text` (его неотправленные правки, если есть, остаются рядом).
+ * инцидентов задвоения 2026-08-03 и оживления тумбстоуна (ревью 0.3.8). Правку,
+ * записанную в историю, клиент со старой историей применяет и без своих
+ * неотправленных правок сходится ровно к `text`.
+ *
+ * ⚠️ И `'edit'` нельзя делать удалением всего текста со вставкой: неотправленные
+ * правки устройства, которые держатся за удалённые элементы, при слиянии уезжали
+ * (вставка в середине строки — в начало заметки, дописанная строка — в начало),
+ * удалённая офлайн строка возвращалась, заменённое слово удваивалось.
  */
 export function extendYjsState(
   stored: Uint8Array | null | undefined,
   text: string,
+  mode: TextWriteMode,
+  limits: TextDiffLimits = TEXT_DIFF_LIMITS,
 ): { state: Uint8Array; stateVector: Uint8Array; changed: boolean } {
   const doc = new Y.Doc();
   try {
@@ -254,8 +380,12 @@ export function extendYjsState(
     const changed = ytext.toString() !== text;
     if (changed) {
       doc.transact(() => {
-        ytext.delete(0, ytext.length);
-        ytext.insert(0, text);
+        if (mode === 'edit') {
+          editYText(ytext, text, limits);
+        } else {
+          ytext.delete(0, ytext.length);
+          ytext.insert(0, text);
+        }
       });
     }
     return {
@@ -273,13 +403,17 @@ export function extendYjsState(
  * история продолжается, а не заменяется. Строка создаётся, если её не было;
  * если текст уже совпадает, строка не переписывается.
  */
-export async function writeYjsText(fileId: string, text: string): Promise<{ changed: boolean }> {
+export async function writeYjsText(
+  fileId: string,
+  text: string,
+  mode: TextWriteMode,
+): Promise<{ changed: boolean }> {
   const stored = await prisma.yjsDocument.findUnique({
     where: { fileId },
     select: { state: true },
   });
   const previous = stored?.state && stored.state.length > 0 ? new Uint8Array(stored.state) : null;
-  const next = extendYjsState(previous, text);
+  const next = extendYjsState(previous, text, mode);
   if (previous && !next.changed) return { changed: false };
   const state = Buffer.from(next.state);
   const stateVector = Buffer.from(next.stateVector);
