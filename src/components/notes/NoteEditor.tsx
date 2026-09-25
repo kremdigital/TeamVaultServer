@@ -104,9 +104,12 @@ export function NoteEditor({ projectId, fileId, userName, onExit }: NoteEditorPr
     async function start(): Promise<void> {
       if (!socket.connected) socket.connect();
       try {
+        // Only the room: this note's doc comes through `yjs:fetch`, and the
+        // editor has no use for the vault's docs or the operation journal.
         const join = await emitAck<JoinAck>(socket, 'project:join', {
           projectId,
           skipYjsCatchup: true,
+          skipOperations: true,
         });
         if (!join.ok) {
           if (!destroyed) setStatus(join.error === 'forbidden' ? 'forbidden' : 'error');

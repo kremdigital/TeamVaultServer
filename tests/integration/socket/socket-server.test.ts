@@ -321,6 +321,46 @@ describe('project:join', () => {
         expect(ack.operations.at(-1)?.filePath).toBe(`A-${CATCHUP_OPERATIONS_LIMIT + 1}.bin`);
       }
     });
+
+    it('skipOperations (the web editor) gets no operations, and still the room', async () => {
+      const { userId, plainKey } = await bootstrapUserAndKey('web-editor');
+      const project = await createProject(userId);
+      await seedJournal(project.id, 600);
+
+      const editor = connect(plainKey);
+      await new Promise<void>((resolve) => editor.on('connect', () => resolve()));
+      const ack = await emitWithAck<OpsAck & { yjsSkipped?: boolean }>(editor, 'project:join', {
+        projectId: project.id,
+        skipYjsCatchup: true,
+        skipOperations: true,
+      });
+
+      expect(ack.ok).toBe(true);
+      expect(ack.operations).toEqual([]);
+      expect(ack.yjsSkipped).toBe(true);
+      expect('operationsTruncated' in ack).toBe(false);
+
+      // Joined all the same: a teammate's operation reaches it live.
+      type Created = { clientId?: string; result: { outcome: { path?: string } } };
+      const created = new Promise<Created>((resolve) =>
+        editor.on('file:created', (e: Created) => resolve(e)),
+      );
+      const peer = connect(plainKey);
+      await new Promise<void>((resolve) => peer.on('connect', () => resolve()));
+      await emitWithAck(peer, 'project:join', { projectId: project.id, skipOperations: true });
+      await emitWithAck(peer, 'file:create', {
+        projectId: project.id,
+        clientId: 'peer',
+        filePath: 'live.md',
+        fileType: 'TEXT',
+        contentHash: 'h',
+        size: 1,
+        data: Array.from(Buffer.from('x')),
+      });
+      const event = await created;
+      expect(event.clientId).toBe('peer');
+      expect(event.result.outcome.path).toBe('live.md');
+    });
   });
 
   it('refuses join for a non-member project', async () => {

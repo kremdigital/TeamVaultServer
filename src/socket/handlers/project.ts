@@ -32,6 +32,12 @@ export interface JoinPayload {
    * it edits via `yjs:fetch` instead of the whole vault.
    */
   skipYjsCatchup?: boolean;
+  /**
+   * No op-log catch-up: `operations` comes back empty. The web editor sets it —
+   * it reads none of them, and a join of a long journal carried up to 5000 rows
+   * (`CATCHUP_OPERATIONS_LIMIT`, megabytes) to every note it opened.
+   */
+  skipOperations?: boolean;
 }
 
 export interface YjsDocSnapshot {
@@ -125,10 +131,12 @@ export function attachProjectHandlers(_io: Server, socket: Socket): void {
     await socket.join(projectRoom(payload.projectId));
 
     // 1) Operation log catch-up.
-    const { operations: ops, truncated } = await listOperationsSince({
-      projectId: payload.projectId,
-      since: payload.sinceVectorClock ?? {},
-    });
+    const { operations: ops, truncated } = payload.skipOperations
+      ? { operations: [], truncated: false }
+      : await listOperationsSince({
+          projectId: payload.projectId,
+          since: payload.sinceVectorClock ?? {},
+        });
     if (truncated) {
       log.warn(
         { projectId: payload.projectId, ops: ops.length },
@@ -283,5 +291,6 @@ function parseJoinPayload(raw: unknown): JoinPayload | null {
     sinceVectorClock: parseClock(data['sinceVectorClock']),
     streamYjs: data['streamYjs'] === true,
     skipYjsCatchup: data['skipYjsCatchup'] === true,
+    skipOperations: data['skipOperations'] === true,
   };
 }

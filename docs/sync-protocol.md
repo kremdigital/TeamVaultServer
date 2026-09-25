@@ -58,7 +58,7 @@ WSS /socket.io/
   // (canViewProject / canEditFiles) проверяются ниже на каждом событии:
   // VIEWER может подключиться и читать, но получит `forbidden` на запись.
 
-→ project:join { projectId, sinceVectorClock?, streamYjs?, skipYjsCatchup? }
+→ project:join { projectId, sinceVectorClock?, streamYjs?, skipYjsCatchup?, skipOperations? }
 ← ack {
     ok: true,
     operations: OperationLogRow[],   // невиденные клиентом, по createdAt (затем id) asc
@@ -109,6 +109,13 @@ live-бродкастов `yjs:update`), но Yjs-доки **не** стримя
 `{ ok, operations, yjsSkipped: true }`. Используется **веб-редактором**: он
 открывает по одной заметке и тянет нужный док точечно через `yjs:fetch` (см.
 ниже), вместо catch-up всего вальта.
+
+`skipOperations` — без catch-up журнала: `operations` в ack пустой, запрос к
+журналу не выполняется, `operationsTruncated` не ставится. Комната и живые
+трансляции — как обычно. Веб-редактор шлёт его вместе с `skipYjsCatchup`: он не
+читает операций, а `since` у него нет, и на длинном журнале каждое открытие заметки
+везло бы в браузер до 5000 строк (мегабайты). Старый сервер флаг игнорирует и
+отдаёт операции, как раньше.
 
 `streamYjs` — клиент просит **не** класть весь Yjs-стейт в ack. Иначе на большом
 вальте (сотни текстовых файлов) ack раздувается: сервер грузит все Y.Doc'ы в
@@ -543,7 +550,7 @@ socket.emit('yjs:update', {
 диске (как и при catch-up). Клиент применяет `sync1` к локальному `Y.Doc` и
 дальше работает как обычно (шлёт `yjs:update`, принимает бродкасты).
 
-> Типовой поток веб-редактора: `project:join { skipYjsCatchup: true }` →
+> Типовой поток веб-редактора: `project:join { skipYjsCatchup: true, skipOperations: true }` →
 > `yjs:fetch { fileId }` → правки идут `yjs:update`, бродкасты применяются.
 
 **Плагин (≥ 0.3.2) тоже вызывает `yjs:fetch`** — но как точечный ремонт, а

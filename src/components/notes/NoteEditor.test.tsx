@@ -49,6 +49,24 @@ function serveDoc(server: Y.Doc): void {
   });
 }
 
+describe('NoteEditor — joining the project', () => {
+  it('asks for the room only: no Yjs catch-up and no operation journal', async () => {
+    const server = new Y.Doc();
+    server.getText('content').insert(0, 'текст');
+    serveDoc(server);
+
+    const view = render(<NoteEditor projectId="P1" fileId="F1" onExit={vi.fn()} />);
+    await screen.findByText('editorLive');
+
+    expect(emitAck).toHaveBeenCalledWith(fakeSocket, 'project:join', {
+      projectId: 'P1',
+      skipYjsCatchup: true,
+      skipOperations: true,
+    });
+    view.unmount();
+  });
+});
+
 describe('NoteEditor — text handed back on close', () => {
   it('passes the current text, edits made while open included', async () => {
     const server = new Y.Doc();
