@@ -93,8 +93,8 @@ export async function applyOperation(ctx: ApplyContext, op: OperationInput): Pro
  * {@link listOperationsSince} and `docs/sync-protocol.md`, «Подключение»).
  *
  * A reconnect after a day offline misses tens to hundreds of operations; a
- * fresh client gets the whole journal, 609 rows in the largest project today.
- * It needs it: an attachment reaches a fresh client only through the CREATE
+ * fresh client gets the whole journal, about 600 rows in S1Test2 today. It
+ * needs it: an attachment reaches a fresh client only through the CREATE
  * of it, the listing and the Yjs catch-up don't carry its bytes. 5000 keeps
  * every such catch-up whole with room to grow, while the ack stays within a
  * few megabytes (700–800 bytes per row as JSON) and the client's replay, one
