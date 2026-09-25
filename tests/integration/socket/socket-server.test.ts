@@ -7,6 +7,9 @@ import * as Y from 'yjs';
 import { Server as IOServer, type ServerOptions } from 'socket.io';
 import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
 import { createIoServer } from '@/socket/server';
+import { relay } from '@/socket/rest-bridge';
+import type { ApplyResult } from '@/lib/sync/operation-log';
+import { applyRestOperation } from '@/lib/sync/rest-write';
 import { generateApiKey } from '@/lib/auth/api-key';
 import { signAccessToken } from '@/lib/auth/jwt';
 import { TEXT_KEY } from '@/lib/crdt/persistence';
@@ -706,6 +709,8 @@ type FileEventPayload = {
   fileId?: string;
   newPath?: string;
   requestedPath?: string;
+  revived?: boolean;
+  viaRest?: boolean;
   result?: { outcome?: { fileId?: string } };
 };
 
@@ -733,6 +738,7 @@ describe('file:* broadcasts (contract with the plugin)', () => {
     for (const e of await created) {
       expect(e.clientId).toBe('client-A');
       expect(e.result?.outcome?.fileId).toBe(fileId);
+      expect(e.revived).toBe(false);
     }
 
     const updated = nextEvent<FileEventPayload>(b, 'file:updated-binary');
@@ -889,8 +895,10 @@ describe('file:* broadcasts (contract with the plugin)', () => {
       'yjs:update',
       (m) => m.fileId === fileId,
     );
+    const revivedEvent = nextEvent<FileEventPayload>(b, 'file:created');
     const again = await createUntitled(NEW, 'h-new');
     expect(again.outcome.fileId).toBe(fileId);
+    expect(await revivedEvent).toMatchObject({ revived: true, clientId: 'client-A' });
 
     Y.applyUpdate(peer, Uint8Array.from((await revivedState).update));
     expect(peer.getText(TEXT_KEY).toString()).toBe(NEW);
@@ -906,5 +914,63 @@ describe('file:* broadcasts (contract with the plugin)', () => {
     const server = new Y.Doc();
     Y.applyUpdate(server, new Uint8Array(stored.state));
     expect(server.getText(TEXT_KEY).toString()).toBe(NEW);
+  });
+
+  it('file:created from the REST bridge carries revived, like the socket event', async () => {
+    // MCP write_note on the path of a deleted note: the server revives the id
+    // with its history extended and logs `revived: true`. The bridge sent a
+    // `result` without the log, so the live event lost the marker, and a client
+    // deciding by it took the new server for one that replaced the history.
+    const { projectId, a } = await twoMembersInRoom();
+    const { ownerId } = await testPrisma.project.findUniqueOrThrow({ where: { id: projectId } });
+    const restCreate = (text: string) =>
+      applyRestOperation({
+        projectId,
+        userId: ownerId,
+        op: {
+          opType: 'CREATE',
+          filePath: 'Untitled.md',
+          payload: {
+            fileType: 'TEXT',
+            contentHash: sha256OfBuffer(Buffer.from(text)),
+            size: Buffer.byteLength(text),
+          },
+          data: Buffer.from(text),
+        },
+      });
+    // What the socket process does with the channel notification the web
+    // process published for this write.
+    const relayed = async (result: ApplyResult) => {
+      const outcome = result.outcome as { fileId: string; path: string };
+      const event = nextEvent<FileEventPayload>(a, 'file:created');
+      await relay(io, {
+        projectId,
+        logId: result.log.id,
+        event: 'file:created',
+        clientId: `rest:${ownerId}`,
+        fileId: outcome.fileId,
+        path: outcome.path,
+      });
+      return event;
+    };
+
+    const first = await restCreate('old text\n');
+    const fileId = (first.outcome as { fileId: string }).fileId;
+    expect(await relayed(first)).toMatchObject({ revived: false, viaRest: true });
+
+    await applyRestOperation({
+      projectId,
+      userId: ownerId,
+      op: { opType: 'DELETE', filePath: 'Untitled.md', payload: { fileId } },
+    });
+    const again = await restCreate('new note\n');
+    expect(again.outcome).toMatchObject({ kind: 'created', fileId });
+    expect(again.log.payload).toMatchObject({ revived: true });
+    expect(await relayed(again)).toMatchObject({
+      revived: true,
+      viaRest: true,
+      clientId: `rest:${ownerId}`,
+      result: { outcome: { fileId } },
+    });
   });
 });

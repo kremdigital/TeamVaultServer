@@ -84,6 +84,17 @@ describe('buildEventPayload', () => {
     }
   });
 
+  it('file:created несёт revived: true/false, как сокетное событие', () => {
+    // POST на месте удалённой заметки (MCP write_note) оживляет тот же id с
+    // продолженной историей. Маркер из журнала мост раньше терял: в `result`
+    // у него только `outcome`, и клиент принимал такое оживление за сервер,
+    // который историю заменял.
+    const revived = buildEventPayload(note({ event: 'file:created' }), log, { revived: true });
+    expect(revived.revived).toBe(true);
+    const fresh = buildEventPayload(note({ event: 'file:created' }), log);
+    expect(fresh.revived).toBe(false);
+  });
+
   it('file:renamed/moved — requestedPath совпадает с newPath: REST не уводит в conflict-копию', () => {
     for (const event of ['file:renamed', 'file:moved'] as const) {
       const p = buildEventPayload(note({ event, path: 'было.md', newPath: 'стало.md' }), log);

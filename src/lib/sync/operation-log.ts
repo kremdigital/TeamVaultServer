@@ -117,6 +117,21 @@ export async function listOperationsSince(opts: {
   });
 }
 
+/**
+ * Whether an `OperationLog` payload records a CREATE that brought a tombstoned
+ * id back, its Y.Doc history extended rather than replaced (`payload.revived`,
+ * see {@link applyCreate}). The live `file:created` broadcast carries the same
+ * answer as a top-level `revived`, from the socket handler and the REST bridge
+ * alike.
+ */
+export function isRevivedCreate(payload: unknown): boolean {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    (payload as { revived?: unknown }).revived === true
+  );
+}
+
 // ---------------------------------------------------------------------------
 // CREATE
 // ---------------------------------------------------------------------------

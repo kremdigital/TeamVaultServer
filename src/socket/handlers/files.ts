@@ -1,7 +1,7 @@
 import type { Server, Socket } from 'socket.io';
 import { prisma } from '@/lib/db/client';
 import { canEditFiles, loadProjectAccess } from '@/lib/auth/permissions';
-import { applyOperation, type OperationInput } from '@/lib/sync/operation-log';
+import { applyOperation, isRevivedCreate, type OperationInput } from '@/lib/sync/operation-log';
 import { increment, type VectorClock, parseClock } from '@/lib/sync/vector-clock';
 import { child } from '@/lib/logger';
 import { deleteStagedBlob, PathIsDirectoryError, readStagedBlob } from '@/lib/files/storage';
@@ -110,6 +110,11 @@ export function attachFileHandlers(io: Server, socket: Socket): void {
       io.to(projectRoom(raw.projectId)).emit('file:created', {
         result,
         clientId: raw.clientId,
+        // An old id back from a tombstone, its Y.Doc history extended. Always
+        // present (true/false), so a client can tell this server from one that
+        // replaced the history and never sent the field. The REST bridge sends
+        // the same field.
+        revived: isRevivedCreate(result.log.payload),
         log: serializeLog(result.log),
       });
 

@@ -13,6 +13,7 @@ import { prisma } from '@/lib/db/client';
 import { logger } from '@/lib/logger';
 import { projectRoom } from './auth';
 import { subscribeToOperations, type OperationNotification } from '@/lib/realtime/bridge';
+import { isRevivedCreate } from '@/lib/sync/operation-log';
 
 export interface SerializedLog {
   id: string;
@@ -34,6 +35,7 @@ export interface SerializedLog {
 export function buildEventPayload(
   note: OperationNotification,
   log: SerializedLog,
+  meta: { revived?: boolean } = {},
 ): Record<string, unknown> {
   // `clientId` — автор операции, как у сокетных событий: у REST это псевдоклиент
   // `rest:<userId>`. По нему клиент узнаёт своё эхо; здесь своих у плагина нет,
@@ -41,10 +43,15 @@ export function buildEventPayload(
   const clientId = note.clientId;
   switch (note.event) {
     case 'file:created':
-      // Плагин достаёт fileId и path из `result.outcome`.
+      // Плагин достаёт fileId и path из `result.outcome`. `revived` — как у
+      // сокетного события: POST на месте удалённой заметки (MCP `write_note`)
+      // оживляет тот же id с продолженной историей. Полного журнала в
+      // `result` здесь нет, поэтому без явного поля клиент принял бы такое
+      // оживление за сервер, который историю заменял.
       return {
         result: { outcome: { kind: 'created', fileId: note.fileId, path: note.path } },
         clientId,
+        revived: meta.revived === true,
         log,
       };
     case 'file:updated-binary':
@@ -68,10 +75,15 @@ export function buildEventPayload(
   }
 }
 
-async function relay(io: IOServer, note: OperationNotification): Promise<void> {
+/**
+ * Разослать в комнату одну операцию из канала. Экспортируется для
+ * интеграционного теста: канал `LISTEN/NOTIFY` проверяется отдельно
+ * (`tests/integration/realtime-bridge.test.ts`).
+ */
+export async function relay(io: IOServer, note: OperationNotification): Promise<void> {
   const row = await prisma.operationLog.findUnique({
     where: { id: note.logId },
-    select: { id: true, vectorClock: true, createdAt: true },
+    select: { id: true, vectorClock: true, createdAt: true, payload: true },
   });
   if (!row) {
     logger.warn({ note }, 'операция из канала не найдена в журнале');
@@ -114,7 +126,8 @@ async function relay(io: IOServer, note: OperationNotification): Promise<void> {
     return;
   }
 
-  io.to(room).emit(note.event, { ...buildEventPayload(note, log), viaRest: true });
+  const payload = buildEventPayload(note, log, { revived: isRevivedCreate(row.payload) });
+  io.to(room).emit(note.event, { ...payload, viaRest: true });
   if (note.event === 'file:created' && isText) await sendYjs();
 
   logger.info(
